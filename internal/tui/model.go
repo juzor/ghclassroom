@@ -11,7 +11,6 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
-// panelState tracks which panel is active.
 type panelState int
 
 const (
@@ -21,8 +20,8 @@ const (
 	panelActivity
 )
 
-// Async result messages — each carries its own key so the handler can cache
-// the result without relying on the current cursor position.
+// Async result messages — each carries its own cache key so the handler
+// does not depend on the cursor position at the time the response arrives.
 
 type classroomsLoadedMsg struct {
 	classrooms []api.Classroom
@@ -86,7 +85,7 @@ func New(token string) Model {
 }
 
 func (m Model) Init() tea.Cmd {
-	return loadClassroomsCmd(m.token)
+	return tea.Batch(loadClassroomsCmd(m.token), m.classrooms.spinner.Tick)
 }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -95,6 +94,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 		w := m.panelWidths()
+		// setSize receives inner content dimensions (border = 2 per axis).
 		ch := max(0, m.height-3)
 		m.classrooms.setSize(max(0, w[0]-2), ch)
 		m.assignments.setSize(max(0, w[1]-2), ch)
@@ -119,7 +119,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.cache.assignments[msg.classroomID] = msg.assignments
-		m.assignments.SetItems(msg.assignments)
+		m.assignments.SetItems(msg.classroomID, msg.assignments)
 		return m, nil
 
 	case studentsLoadedMsg:
@@ -144,6 +144,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.KeyMsg:
 		m.statusMsg = ""
+		// While the assignments filter is active, let the list consume all
+		// keystrokes (esc exits filter mode, enter applies it, etc.).
+		if m.state == panelAssignments && m.assignments.IsFiltering() {
+			if msg.String() == "ctrl+c" {
+				return m, tea.Quit
+			}
+			return m.routeToActivePanel(msg)
+		}
 		switch msg.String() {
 		case "q", "ctrl+c":
 			return m, tea.Quit
@@ -182,26 +190,20 @@ func (m Model) View() string {
 	}
 
 	statusBar := m.renderStatusBar()
+	// ch = inner content height; panels receive outer height = ch+2.
+	ch := max(0, m.height-3)
+	outerH := ch + 2
 
 	if m.width < 100 {
-		inner := max(0, m.width-2)
-		ch := max(0, m.height-3)
-		content := m.activeView(inner)
-		panel := activePanelStyle.Width(inner).Height(ch).Render(content)
+		panel := m.activePanel(m.width, outerH)
 		return panel + "\n" + statusBar
 	}
 
 	w := m.panelWidths()
-	ch := max(0, m.height-3)
-
-	p0 := panelStyle(m.state == panelClassrooms).Width(max(0, w[0]-2)).Height(ch).Render(
-		m.classrooms.View(max(0, w[0]-2), m.state == panelClassrooms))
-	p1 := panelStyle(m.state == panelAssignments).Width(max(0, w[1]-2)).Height(ch).Render(
-		m.assignments.View(max(0, w[1]-2), m.state == panelAssignments))
-	p2 := panelStyle(m.state == panelStudents).Width(max(0, w[2]-2)).Height(ch).Render(
-		m.students.View(max(0, w[2]-2), m.state == panelStudents))
-	p3 := panelStyle(m.state == panelActivity).Width(max(0, w[3]-2)).Height(ch).Render(
-		m.activity.View(max(0, w[3]-2), m.state == panelActivity))
+	p0 := m.classrooms.View(m.state == panelClassrooms, w[0], outerH)
+	p1 := m.assignments.View(m.state == panelAssignments, w[1], outerH)
+	p2 := m.students.View(m.state == panelStudents, w[2], outerH)
+	p3 := m.activity.View(m.state == panelActivity, w[3], outerH)
 
 	row := lipgloss.JoinHorizontal(lipgloss.Top, p0, p1, p2, p3)
 	return row + "\n" + statusBar
@@ -220,16 +222,17 @@ func (m Model) panelWidths() [4]int {
 	return w
 }
 
-func (m Model) activeView(width int) string {
+// activePanel renders only the active panel (used when width < 100).
+func (m Model) activePanel(width, height int) string {
 	switch m.state {
 	case panelClassrooms:
-		return m.classrooms.View(width, true)
+		return m.classrooms.View(true, width, height)
 	case panelAssignments:
-		return m.assignments.View(width, true)
+		return m.assignments.View(true, width, height)
 	case panelStudents:
-		return m.students.View(width, true)
+		return m.students.View(true, width, height)
 	case panelActivity:
-		return m.activity.View(width, true)
+		return m.activity.View(true, width, height)
 	}
 	return ""
 }
@@ -251,11 +254,11 @@ func (m Model) handleForward() (tea.Model, tea.Cmd) {
 		}
 		m.state = panelAssignments
 		if cached, ok := m.cache.assignments[cl.ID]; ok {
-			m.assignments.SetItems(cached)
+			m.assignments.SetItems(cl.ID, cached)
 			return m, nil
 		}
 		m.assignments.loading = true
-		return m, loadAssignmentsCmd(m.token, cl.ID)
+		return m, tea.Batch(loadAssignmentsCmd(m.token, cl.ID), m.assignments.spinner.Tick)
 
 	case panelAssignments:
 		a := m.assignments.SelectedItem()
@@ -304,13 +307,13 @@ func (m Model) handleRefresh() (tea.Model, tea.Cmd) {
 	case panelClassrooms:
 		m.cache.classrooms = nil
 		m.classrooms.loading = true
-		return m, loadClassroomsCmd(m.token)
+		return m, tea.Batch(loadClassroomsCmd(m.token), m.classrooms.spinner.Tick)
 
 	case panelAssignments:
 		if cl := m.classrooms.SelectedItem(); cl != nil {
 			delete(m.cache.assignments, cl.ID)
 			m.assignments.loading = true
-			return m, loadAssignmentsCmd(m.token, cl.ID)
+			return m, tea.Batch(loadAssignmentsCmd(m.token, cl.ID), m.assignments.spinner.Tick)
 		}
 
 	case panelStudents:
@@ -339,11 +342,7 @@ func (m Model) currentURL() string {
 			return cl.URL
 		}
 	case panelAssignments:
-		if cl := m.classrooms.SelectedItem(); cl != nil {
-			if a := m.assignments.SelectedItem(); a != nil {
-				return api.ReportURL(cl.ID, a.ID)
-			}
-		}
+		return m.assignments.SelectedReportURL()
 	case panelStudents, panelActivity:
 		if s := m.students.SelectedItem(); s != nil {
 			return s.Repository.HTMLURL
@@ -357,11 +356,7 @@ func (m Model) currentURL() string {
 func (m Model) currentCopyURL() string {
 	switch m.state {
 	case panelAssignments, panelStudents:
-		if cl := m.classrooms.SelectedItem(); cl != nil {
-			if a := m.assignments.SelectedItem(); a != nil {
-				return api.ReportURL(cl.ID, a.ID)
-			}
-		}
+		return m.assignments.SelectedReportURL()
 	case panelActivity:
 		if s := m.students.SelectedItem(); s != nil {
 			return s.Repository.HTMLURL
@@ -385,7 +380,7 @@ func (m Model) routeToActivePanel(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
-// Lipgloss styles.
+// Package-level styles used by all panels and the status bar.
 var (
 	activePanelStyle = lipgloss.NewStyle().
 				Border(lipgloss.RoundedBorder()).
@@ -398,6 +393,9 @@ var (
 
 	statusBarStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("241"))
+
+	// dimStyle is used inline in panel content (description text, URL line).
+	dimStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
 )
 
 func panelStyle(active bool) lipgloss.Style {

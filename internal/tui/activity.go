@@ -30,9 +30,12 @@ func (p ActivityPanel) Update(msg tea.Msg) (ActivityPanel, tea.Cmd) {
 	return p, nil
 }
 
-func (p ActivityPanel) View(width int, active bool) string {
+func (p ActivityPanel) View(active bool, width, height int) string {
+	inner := max(0, width-2)
+	innerH := max(0, height-2)
+	content := ""
 	if p.loading {
-		return "Loading…"
+		content = "Loading…"
 	}
-	return ""
+	return panelStyle(active).Width(inner).Height(innerH).Render(content)
 }
