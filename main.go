@@ -44,9 +44,7 @@ func main() {
 		}
 	}
 
-	_ = cfg
-
-	p := tea.NewProgram(tui.New())
+	p := tea.NewProgram(tui.New(cfg.Token), tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "error running TUI: %v\n", err)
 		os.Exit(1)
