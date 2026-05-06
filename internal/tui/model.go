@@ -166,6 +166,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if url := m.currentURL(); url != "" {
 				if err := openURL(url); err != nil {
 					m.statusMsg = "cannot open browser: " + err.Error()
+				} else {
+					m.statusMsg = "Opened in browser"
 				}
 			}
 			return m, nil
@@ -175,7 +177,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.statusMsg = "URL: " + url
 				} else {
 					clipboard.Write(clipboard.FmtText, []byte(url))
-					m.statusMsg = "copied!"
+					m.statusMsg = "Copied to clipboard"
 				}
 			}
 			return m, nil

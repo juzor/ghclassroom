@@ -5,7 +5,7 @@ import (
 	"net/http"
 )
 
-const classroomBase = "https://classroom.github.com/api/v1"
+const classroomBase = "https://api.github.com"
 
 func GetClassrooms(token string) ([]Classroom, error) {
 	var out []Classroom
