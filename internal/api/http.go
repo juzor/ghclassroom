@@ -26,8 +26,7 @@ func doRequest(token, method, url string, out interface{}) error {
 	defer resp.Body.Close()
 
 	if resp.Header.Get("X-RateLimit-Remaining") == "0" {
-		reset := resp.Header.Get("X-RateLimit-Reset")
-		return fmt.Errorf("rate limit reached, resets at %s", parseResetTime(reset))
+		return &RateLimitError{ResetAt: parseResetTime(resp.Header.Get("X-RateLimit-Reset"))}
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
@@ -38,10 +37,10 @@ func doRequest(token, method, url string, out interface{}) error {
 	return json.NewDecoder(resp.Body).Decode(out)
 }
 
-func parseResetTime(unixStr string) string {
+func parseResetTime(unixStr string) time.Time {
 	ts, err := strconv.ParseInt(unixStr, 10, 64)
-	if err != nil {
-		return unixStr
+	if err != nil || ts == 0 {
+		return time.Now().Add(60 * time.Second)
 	}
-	return time.Unix(ts, 0).UTC().Format("2006-01-02 15:04:05 UTC")
+	return time.Unix(ts, 0)
 }

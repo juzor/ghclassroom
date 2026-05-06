@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"fmt"
 	"strings"
 
 	"ghclassroom/internal/api"
@@ -10,7 +11,6 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
-// studentItem adapts api.AcceptedAssignment to bubbles/list.Item.
 type studentItem struct{ assignment api.AcceptedAssignment }
 
 func (i studentItem) FilterValue() string { return i.Title() }
@@ -33,16 +33,19 @@ func (i studentItem) Title() string {
 func (i studentItem) Description() string { return i.assignment.Repository.FullName }
 
 type StudentsPanel struct {
-	list         list.Model
-	loading      bool
-	spinner      spinner.Model
-	assignmentID int
+	list           list.Model
+	loading        bool
+	loaded         bool
+	spinner        spinner.Model
+	assignmentID   int
+	totalCount     int
+	submittedCount int
 }
 
 func newStudentsPanel() StudentsPanel {
 	delegate := list.NewDefaultDelegate()
 	l := list.New([]list.Item{}, delegate, 0, 0)
-	l.Title = "Students"
+	l.SetShowTitle(false)
 	l.SetShowStatusBar(false)
 	l.SetShowHelp(false)
 
@@ -53,17 +56,23 @@ func newStudentsPanel() StudentsPanel {
 }
 
 func (p *StudentsPanel) setSize(w, h int) {
-	p.list.SetSize(w, h)
+	p.list.SetSize(w, max(0, h-2))
 }
 
 func (p *StudentsPanel) SetItems(assignmentID int, students []api.AcceptedAssignment) {
 	p.assignmentID = assignmentID
+	p.totalCount = len(students)
+	p.submittedCount = 0
 	items := make([]list.Item, len(students))
 	for i, s := range students {
+		if s.Submitted {
+			p.submittedCount++
+		}
 		items[i] = studentItem{assignment: s}
 	}
 	p.list.SetItems(items)
 	p.loading = false
+	p.loaded = true
 }
 
 func (p StudentsPanel) SelectedItem() *api.AcceptedAssignment {
@@ -73,6 +82,19 @@ func (p StudentsPanel) SelectedItem() *api.AcceptedAssignment {
 	}
 	a := item.assignment
 	return &a
+}
+
+func (p StudentsPanel) countStr() string {
+	if p.loading {
+		return "…"
+	}
+	if !p.loaded {
+		return "—"
+	}
+	if p.submittedCount < p.totalCount {
+		return fmt.Sprintf("%d · %d submitted", p.totalCount, p.submittedCount)
+	}
+	return fmt.Sprintf("%d", p.totalCount)
 }
 
 func (p StudentsPanel) Update(msg tea.Msg) (StudentsPanel, tea.Cmd) {
@@ -88,22 +110,30 @@ func (p StudentsPanel) Update(msg tea.Msg) (StudentsPanel, tea.Cmd) {
 func (p StudentsPanel) View(active bool, width, height int) string {
 	inner := max(0, width-2)
 	innerH := max(0, height-2)
+	availH := max(0, innerH-2)
+
+	hdr := renderPanelHeader("Students", p.countStr(), active, inner)
 
 	if p.loading {
-		content := lipgloss.NewStyle().
-			Width(inner).Height(innerH).
+		body := lipgloss.NewStyle().Width(inner).Height(availH).
 			Align(lipgloss.Center, lipgloss.Center).
-			Render(p.spinner.View())
-		return panelStyle(active).Width(inner).Height(innerH).Render(content)
+			Render(p.spinner.View() + " Loading students…\n" + dimStyle.Render("GET /assignments/{id}/accepted_assignments"))
+		return panelStyle(active).Width(inner).Height(innerH).Render(hdr + body)
 	}
 
-	if len(p.list.Items()) == 0 {
-		content := lipgloss.NewStyle().
-			Width(inner).Height(innerH).
+	if !p.loaded {
+		body := lipgloss.NewStyle().Width(inner).Height(availH).
+			Align(lipgloss.Center, lipgloss.Center).
+			Render(dimStyle.Render("—"))
+		return panelStyle(active).Width(inner).Height(innerH).Render(hdr + body)
+	}
+
+	if p.totalCount == 0 {
+		body := lipgloss.NewStyle().Width(inner).Height(availH).
 			Align(lipgloss.Center, lipgloss.Center).
 			Render("No accepted assignments yet.")
-		return panelStyle(active).Width(inner).Height(innerH).Render(content)
+		return panelStyle(active).Width(inner).Height(innerH).Render(hdr + body)
 	}
 
-	return panelStyle(active).Width(inner).Height(innerH).Render(p.list.View())
+	return panelStyle(active).Width(inner).Height(innerH).Render(hdr + p.list.View())
 }
