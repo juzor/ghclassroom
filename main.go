@@ -1,9 +1,11 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"os"
 
+	"golang.design/x/clipboard"
 	tea "github.com/charmbracelet/bubbletea"
 	"ghclassroom/internal/config"
 	"ghclassroom/internal/tui"
@@ -11,6 +13,22 @@ import (
 )
 
 func main() {
+	versionFlag := flag.Bool("version", false, "print version and exit")
+	reconfigure := flag.Bool("reconfigure", false, "delete saved token and re-run first-run setup")
+	flag.Parse()
+
+	if *versionFlag {
+		fmt.Println("ghclassroom v0.1.0")
+		os.Exit(0)
+	}
+
+	if *reconfigure {
+		if err := config.Delete(); err != nil && !os.IsNotExist(err) {
+			fmt.Fprintf(os.Stderr, "error deleting config: %v\n", err)
+			os.Exit(1)
+		}
+	}
+
 	cfg, err := config.LoadConfig()
 	if err != nil {
 		if !os.IsNotExist(err) {
@@ -44,7 +62,11 @@ func main() {
 		}
 	}
 
-	p := tea.NewProgram(tui.New(cfg.Token), tea.WithAltScreen())
+	// Probe clipboard once at startup; pass the result to the TUI so it never
+	// calls Init() again and can degrade gracefully on headless/SSH sessions.
+	clipboardAvailable := clipboard.Init() == nil
+
+	p := tea.NewProgram(tui.New(cfg.Token, clipboardAvailable), tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "error running TUI: %v\n", err)
 		os.Exit(1)

@@ -110,6 +110,14 @@ func (p AssignmentsPanel) View(active bool, width, height int) string {
 		return panelStyle(active).Width(inner).Height(innerH).Render(content)
 	}
 
+	if len(p.list.Items()) == 0 {
+		content := lipgloss.NewStyle().
+			Width(inner).Height(innerH).
+			Align(lipgloss.Center, lipgloss.Center).
+			Render("No assignments in this classroom.")
+		return panelStyle(active).Width(inner).Height(innerH).Render(content)
+	}
+
 	urlLine := dimStyle.Width(inner).Render("Report URL: " + p.selectedURL)
 	content := p.list.View() + "\n" + urlLine
 	return panelStyle(active).Width(inner).Height(innerH).Render(content)

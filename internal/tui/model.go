@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os/exec"
 	"runtime"
+	"strings"
 
 	"ghclassroom/internal/api"
 	"golang.design/x/clipboard"
@@ -55,22 +56,24 @@ type cache struct {
 }
 
 type Model struct {
-	token       string
-	state       panelState
-	width       int
-	height      int
-	cache       cache
-	classrooms  ClassroomsPanel
-	assignments AssignmentsPanel
-	students    StudentsPanel
-	activity    ActivityPanel
-	statusMsg   string
+	token              string
+	clipboardAvailable bool
+	state              panelState
+	width              int
+	height             int
+	cache              cache
+	classrooms         ClassroomsPanel
+	assignments        AssignmentsPanel
+	students           StudentsPanel
+	activity           ActivityPanel
+	statusMsg          string
 }
 
-func New(token string) Model {
+func New(token string, clipboardAvailable bool) Model {
 	m := Model{
-		token: token,
-		state: panelClassrooms,
+		token:              token,
+		clipboardAvailable: clipboardAvailable,
+		state:              panelClassrooms,
 		cache: cache{
 			assignments: make(map[int][]api.Assignment),
 			students:    make(map[int][]api.AcceptedAssignment),
@@ -106,7 +109,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case classroomsLoadedMsg:
 		m.classrooms.loading = false
 		if msg.err != nil {
-			m.statusMsg = msg.err.Error()
+			m.statusMsg = loadErrMsg(msg.err)
 			return m, nil
 		}
 		m.cache.classrooms = msg.classrooms
@@ -116,7 +119,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case assignmentsLoadedMsg:
 		m.assignments.loading = false
 		if msg.err != nil {
-			m.statusMsg = msg.err.Error()
+			m.statusMsg = loadErrMsg(msg.err)
 			return m, nil
 		}
 		m.cache.assignments[msg.classroomID] = msg.assignments
@@ -126,7 +129,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case studentsLoadedMsg:
 		m.students.loading = false
 		if msg.err != nil {
-			m.statusMsg = msg.err.Error()
+			m.statusMsg = loadErrMsg(msg.err)
 			return m, nil
 		}
 		m.cache.students[msg.assignmentID] = msg.students
@@ -136,7 +139,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case activityLoadedMsg:
 		m.activity.loading = false
 		if msg.err != nil {
-			m.statusMsg = msg.err.Error()
+			// Show the error inside the activity panel, not just the status bar.
+			// Do not write to cache — r must be able to retry.
+			m.activity.SetError(msg.err.Error())
+			if isUnauthorized(msg.err) {
+				m.statusMsg = unauthorizedMsg
+			}
 			return m, nil
 		}
 		m.cache.activity[msg.repoFullName] = msg.activity
@@ -173,7 +181,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		case "c":
 			if url := m.currentCopyURL(); url != "" {
-				if err := clipboard.Init(); err != nil {
+				if !m.clipboardAvailable {
 					m.statusMsg = "URL: " + url
 				} else {
 					clipboard.Write(clipboard.FmtText, []byte(url))
@@ -412,6 +420,21 @@ func panelStyle(active bool) lipgloss.Style {
 		return activePanelStyle
 	}
 	return inactivePanelStyle
+}
+
+const unauthorizedMsg = "Token unauthorized. Run ghclassroom with --reconfigure to reset."
+
+// isUnauthorized reports whether an API error is a 401.
+func isUnauthorized(err error) bool {
+	return strings.HasPrefix(err.Error(), "GitHub API 401")
+}
+
+// loadErrMsg returns the user-facing message for a load error.
+func loadErrMsg(err error) string {
+	if isUnauthorized(err) {
+		return unauthorizedMsg
+	}
+	return err.Error()
 }
 
 func openURL(url string) error {

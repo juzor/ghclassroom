@@ -97,5 +97,13 @@ func (p StudentsPanel) View(active bool, width, height int) string {
 		return panelStyle(active).Width(inner).Height(innerH).Render(content)
 	}
 
+	if len(p.list.Items()) == 0 {
+		content := lipgloss.NewStyle().
+			Width(inner).Height(innerH).
+			Align(lipgloss.Center, lipgloss.Center).
+			Render("No accepted assignments yet.")
+		return panelStyle(active).Width(inner).Height(innerH).Render(content)
+	}
+
 	return panelStyle(active).Width(inner).Height(innerH).Render(p.list.View())
 }

@@ -17,6 +17,7 @@ type ActivityPanel struct {
 	loading  bool
 	spinner  spinner.Model
 	repoURL  string
+	errMsg   string
 }
 
 func newActivityPanel() ActivityPanel {
@@ -35,8 +36,15 @@ func (p *ActivityPanel) setSize(w, h int) {
 
 func (p *ActivityPanel) SetActivity(activity *api.RepoActivity, repoFullName, repoURL string) {
 	p.repoURL = repoURL
+	p.errMsg = ""
 	p.viewport.SetContent(renderActivity(activity, repoFullName))
 	p.viewport.GotoTop()
+	p.loading = false
+}
+
+func (p *ActivityPanel) SetError(msg string) {
+	p.errMsg = msg
+	p.repoURL = ""
 	p.loading = false
 }
 
@@ -65,6 +73,14 @@ func (p ActivityPanel) View(active bool, width, height int) string {
 		return panelStyle(active).Width(inner).Height(innerH).Render(content)
 	}
 
+	if p.errMsg != "" {
+		content := lipgloss.NewStyle().
+			Width(inner).Height(innerH).
+			Align(lipgloss.Center, lipgloss.Center).
+			Render("Could not load activity:\n" + p.errMsg)
+		return panelStyle(active).Width(inner).Height(innerH).Render(content)
+	}
+
 	return panelStyle(active).Width(inner).Height(innerH).Render(p.viewport.View())
 }
 
@@ -77,6 +93,9 @@ func renderActivity(a *api.RepoActivity, repoFullName string) string {
 	fmt.Fprintf(&b, "Repo:  %s\n\n", repoFullName)
 
 	fmt.Fprintf(&b, "COMMITS (%d)\n", len(a.Commits))
+	if len(a.Commits) == 0 {
+		fmt.Fprintf(&b, "  No commits yet.\n")
+	}
 	for _, c := range a.Commits {
 		sha := c.SHA
 		if len(sha) > 7 {

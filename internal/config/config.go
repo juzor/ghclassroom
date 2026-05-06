@@ -39,6 +39,10 @@ func SaveConfig(cfg Config) error {
 	return os.WriteFile(path, data, 0600)
 }
 
+func Delete() error {
+	return os.Remove(configPath())
+}
+
 func ValidateToken(token string) error {
 	req, err := http.NewRequest(http.MethodGet, "https://api.github.com/user", nil)
 	if err != nil {

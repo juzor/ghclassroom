@@ -79,5 +79,13 @@ func (p ClassroomsPanel) View(active bool, width, height int) string {
 		return panelStyle(active).Width(inner).Height(innerH).Render(content)
 	}
 
+	if len(p.list.Items()) == 0 {
+		content := lipgloss.NewStyle().
+			Width(inner).Height(innerH).
+			Align(lipgloss.Center, lipgloss.Center).
+			Render("No classrooms found.\nCheck token scopes (repo, read:org).")
+		return panelStyle(active).Width(inner).Height(innerH).Render(content)
+	}
+
 	return panelStyle(active).Width(inner).Height(innerH).Render(p.list.View())
 }
