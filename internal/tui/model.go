@@ -42,6 +42,7 @@ type studentsLoadedMsg struct {
 
 type activityLoadedMsg struct {
 	repoFullName string
+	repoURL      string
 	activity     *api.RepoActivity
 	err          error
 }
@@ -129,7 +130,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.cache.students[msg.assignmentID] = msg.students
-		m.students.SetItems(msg.students)
+		m.students.SetItems(msg.assignmentID, msg.students)
 		return m, nil
 
 	case activityLoadedMsg:
@@ -139,7 +140,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.cache.activity[msg.repoFullName] = msg.activity
-		m.activity.SetActivity(msg.activity)
+		m.activity.SetActivity(msg.activity, msg.repoFullName, msg.repoURL)
 		return m, nil
 
 	case tea.KeyMsg:
@@ -267,11 +268,11 @@ func (m Model) handleForward() (tea.Model, tea.Cmd) {
 		}
 		m.state = panelStudents
 		if cached, ok := m.cache.students[a.ID]; ok {
-			m.students.SetItems(cached)
+			m.students.SetItems(a.ID, cached)
 			return m, nil
 		}
 		m.students.loading = true
-		return m, loadStudentsCmd(m.token, a.ID)
+		return m, tea.Batch(loadStudentsCmd(m.token, a.ID), m.students.spinner.Tick)
 
 	case panelStudents:
 		s := m.students.SelectedItem()
@@ -280,11 +281,14 @@ func (m Model) handleForward() (tea.Model, tea.Cmd) {
 		}
 		m.state = panelActivity
 		if cached, ok := m.cache.activity[s.Repository.FullName]; ok {
-			m.activity.SetActivity(cached)
+			m.activity.SetActivity(cached, s.Repository.FullName, s.Repository.HTMLURL)
 			return m, nil
 		}
 		m.activity.loading = true
-		return m, loadActivityCmd(m.token, s.Repository.FullName)
+		return m, tea.Batch(
+			loadActivityCmd(m.token, s.Repository.FullName, s.Repository.HTMLURL),
+			m.activity.spinner.Tick,
+		)
 	}
 
 	return m, nil
@@ -320,14 +324,17 @@ func (m Model) handleRefresh() (tea.Model, tea.Cmd) {
 		if a := m.assignments.SelectedItem(); a != nil {
 			delete(m.cache.students, a.ID)
 			m.students.loading = true
-			return m, loadStudentsCmd(m.token, a.ID)
+			return m, tea.Batch(loadStudentsCmd(m.token, a.ID), m.students.spinner.Tick)
 		}
 
 	case panelActivity:
 		if s := m.students.SelectedItem(); s != nil {
 			delete(m.cache.activity, s.Repository.FullName)
 			m.activity.loading = true
-			return m, loadActivityCmd(m.token, s.Repository.FullName)
+			return m, tea.Batch(
+				loadActivityCmd(m.token, s.Repository.FullName, s.Repository.HTMLURL),
+				m.activity.spinner.Tick,
+			)
 		}
 	}
 
@@ -343,10 +350,12 @@ func (m Model) currentURL() string {
 		}
 	case panelAssignments:
 		return m.assignments.SelectedReportURL()
-	case panelStudents, panelActivity:
+	case panelStudents:
 		if s := m.students.SelectedItem(); s != nil {
 			return s.Repository.HTMLURL
 		}
+	case panelActivity:
+		return m.activity.RepoURL()
 	}
 	return ""
 }
@@ -358,9 +367,7 @@ func (m Model) currentCopyURL() string {
 	case panelAssignments, panelStudents:
 		return m.assignments.SelectedReportURL()
 	case panelActivity:
-		if s := m.students.SelectedItem(); s != nil {
-			return s.Repository.HTMLURL
-		}
+		return m.activity.RepoURL()
 	}
 	return ""
 }
@@ -441,9 +448,14 @@ func loadStudentsCmd(token string, assignmentID int) tea.Cmd {
 	}
 }
 
-func loadActivityCmd(token string, repoFullName string) tea.Cmd {
+func loadActivityCmd(token, repoFullName, repoURL string) tea.Cmd {
 	return func() tea.Msg {
 		activity, err := api.GetRepoActivity(token, repoFullName)
-		return activityLoadedMsg{repoFullName: repoFullName, activity: activity, err: err}
+		return activityLoadedMsg{
+			repoFullName: repoFullName,
+			repoURL:      repoURL,
+			activity:     activity,
+			err:          err,
+		}
 	}
 }
