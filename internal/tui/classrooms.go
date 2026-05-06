@@ -1,6 +1,8 @@
 package tui
 
 import (
+	"fmt"
+
 	"ghclassroom/internal/api"
 	"github.com/charmbracelet/bubbles/list"
 	"github.com/charmbracelet/bubbles/spinner"
@@ -8,7 +10,6 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
-// classroomItem adapts api.Classroom to bubbles/list.Item.
 type classroomItem struct{ classroom api.Classroom }
 
 func (i classroomItem) FilterValue() string { return i.classroom.Name }
@@ -18,15 +19,17 @@ func (i classroomItem) Description() string { return i.classroom.URL }
 type ClassroomsPanel struct {
 	list    list.Model
 	loading bool
+	loaded  bool
 	spinner spinner.Model
+	count   int
 }
 
 func newClassroomsPanel() ClassroomsPanel {
 	delegate := list.NewDefaultDelegate()
 	l := list.New([]list.Item{}, delegate, 0, 0)
-	l.Title = "Classrooms"
+	l.SetShowTitle(false)
 	l.SetShowStatusBar(false)
-	l.SetFilteringEnabled(false) // spec: "No search needed — classroom lists are short"
+	l.SetFilteringEnabled(false)
 	l.SetShowHelp(false)
 
 	s := spinner.New()
@@ -36,7 +39,7 @@ func newClassroomsPanel() ClassroomsPanel {
 }
 
 func (p *ClassroomsPanel) setSize(w, h int) {
-	p.list.SetSize(w, h)
+	p.list.SetSize(w, max(0, h-2))
 }
 
 func (p *ClassroomsPanel) SetItems(classrooms []api.Classroom) {
@@ -45,7 +48,9 @@ func (p *ClassroomsPanel) SetItems(classrooms []api.Classroom) {
 		items[i] = classroomItem{classroom: c}
 	}
 	p.list.SetItems(items)
+	p.count = len(classrooms)
 	p.loading = false
+	p.loaded = true
 }
 
 func (p ClassroomsPanel) SelectedItem() *api.Classroom {
@@ -70,22 +75,24 @@ func (p ClassroomsPanel) Update(msg tea.Msg) (ClassroomsPanel, tea.Cmd) {
 func (p ClassroomsPanel) View(active bool, width, height int) string {
 	inner := max(0, width-2)
 	innerH := max(0, height-2)
+	availH := max(0, innerH-2)
 
 	if p.loading {
-		content := lipgloss.NewStyle().
-			Width(inner).Height(innerH).
+		hdr := renderPanelHeader("Classrooms", "…", active, inner)
+		body := lipgloss.NewStyle().Width(inner).Height(availH).
 			Align(lipgloss.Center, lipgloss.Center).
-			Render(p.spinner.View())
-		return panelStyle(active).Width(inner).Height(innerH).Render(content)
+			Render(p.spinner.View() + " Loading classrooms…\n" + dimStyle.Render("GET /classrooms"))
+		return panelStyle(active).Width(inner).Height(innerH).Render(hdr + body)
 	}
 
-	if len(p.list.Items()) == 0 {
-		content := lipgloss.NewStyle().
-			Width(inner).Height(innerH).
+	hdr := renderPanelHeader("Classrooms", fmt.Sprintf("%d", p.count), active, inner)
+
+	if p.loaded && p.count == 0 {
+		body := lipgloss.NewStyle().Width(inner).Height(availH).
 			Align(lipgloss.Center, lipgloss.Center).
-			Render("No classrooms found.\nCheck token scopes (repo, read:org).")
-		return panelStyle(active).Width(inner).Height(innerH).Render(content)
+			Render("No classrooms found.\n" + dimStyle.Render("Check token scopes (repo, read:org)."))
+		return panelStyle(active).Width(inner).Height(innerH).Render(hdr + body)
 	}
 
-	return panelStyle(active).Width(inner).Height(innerH).Render(p.list.View())
+	return panelStyle(active).Width(inner).Height(innerH).Render(hdr + p.list.View())
 }

@@ -1,6 +1,8 @@
 package tui
 
 import (
+	"fmt"
+
 	"ghclassroom/internal/api"
 	"github.com/charmbracelet/bubbles/list"
 	"github.com/charmbracelet/bubbles/spinner"
@@ -8,7 +10,6 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
-// assignmentItem adapts api.Assignment to bubbles/list.Item.
 type assignmentItem struct{ assignment api.Assignment }
 
 func (i assignmentItem) FilterValue() string { return i.assignment.Title }
@@ -24,18 +25,19 @@ func (i assignmentItem) Description() string {
 type AssignmentsPanel struct {
 	list        list.Model
 	loading     bool
+	loaded      bool
 	spinner     spinner.Model
 	classroomID int
-	selectedURL string // report URL for the highlighted assignment
+	totalCount  int
+	selectedURL string
 }
 
 func newAssignmentsPanel() AssignmentsPanel {
 	delegate := list.NewDefaultDelegate()
 	l := list.New([]list.Item{}, delegate, 0, 0)
-	l.Title = "Assignments"
+	l.SetShowTitle(false)
 	l.SetShowStatusBar(false)
 	l.SetShowHelp(false)
-	// Filtering enabled by default — do not disable it (spec core UX feature)
 
 	s := spinner.New()
 	s.Spinner = spinner.Dot
@@ -44,18 +46,19 @@ func newAssignmentsPanel() AssignmentsPanel {
 }
 
 func (p *AssignmentsPanel) setSize(w, h int) {
-	// Reserve 1 row below the list for the report URL status line.
-	p.list.SetSize(w, max(0, h-1))
+	p.list.SetSize(w, max(0, h-3))
 }
 
 func (p *AssignmentsPanel) SetItems(classroomID int, assignments []api.Assignment) {
 	p.classroomID = classroomID
+	p.totalCount = len(assignments)
 	items := make([]list.Item, len(assignments))
 	for i, a := range assignments {
 		items[i] = assignmentItem{assignment: a}
 	}
 	p.list.SetItems(items)
 	p.loading = false
+	p.loaded = true
 	p.selectedURL = p.computeSelectedURL()
 }
 
@@ -68,15 +71,24 @@ func (p AssignmentsPanel) SelectedItem() *api.Assignment {
 	return &a
 }
 
-// SelectedReportURL returns the report URL for the currently highlighted assignment.
-func (p AssignmentsPanel) SelectedReportURL() string {
-	return p.selectedURL
-}
+func (p AssignmentsPanel) SelectedReportURL() string { return p.selectedURL }
 
-// IsFiltering reports whether the built-in fuzzy filter is active.
-// Used by the root model to decide whether to pass key events through.
 func (p AssignmentsPanel) IsFiltering() bool {
 	return p.list.FilterState() == list.Filtering
+}
+
+func (p AssignmentsPanel) countStr() string {
+	if p.loading {
+		return "…"
+	}
+	if !p.loaded {
+		return "—"
+	}
+	fs := p.list.FilterState()
+	if fs == list.Filtering || fs == list.FilterApplied {
+		return fmt.Sprintf("%d of %d", len(p.list.VisibleItems()), p.totalCount)
+	}
+	return fmt.Sprintf("%d", p.totalCount)
 }
 
 func (p AssignmentsPanel) computeSelectedURL() string {
@@ -101,24 +113,31 @@ func (p AssignmentsPanel) Update(msg tea.Msg) (AssignmentsPanel, tea.Cmd) {
 func (p AssignmentsPanel) View(active bool, width, height int) string {
 	inner := max(0, width-2)
 	innerH := max(0, height-2)
+	availH := max(0, innerH-2)
+
+	hdr := renderPanelHeader("Assignments", p.countStr(), active, inner)
 
 	if p.loading {
-		content := lipgloss.NewStyle().
-			Width(inner).Height(innerH).
+		body := lipgloss.NewStyle().Width(inner).Height(availH).
 			Align(lipgloss.Center, lipgloss.Center).
-			Render(p.spinner.View())
-		return panelStyle(active).Width(inner).Height(innerH).Render(content)
+			Render(p.spinner.View() + " Loading assignments…\n" + dimStyle.Render("GET /classrooms/{id}/assignments"))
+		return panelStyle(active).Width(inner).Height(innerH).Render(hdr + body)
 	}
 
-	if len(p.list.Items()) == 0 {
-		content := lipgloss.NewStyle().
-			Width(inner).Height(innerH).
+	if !p.loaded {
+		body := lipgloss.NewStyle().Width(inner).Height(availH).
+			Align(lipgloss.Center, lipgloss.Center).
+			Render(dimStyle.Render("select a classroom →"))
+		return panelStyle(active).Width(inner).Height(innerH).Render(hdr + body)
+	}
+
+	if p.totalCount == 0 {
+		body := lipgloss.NewStyle().Width(inner).Height(availH).
 			Align(lipgloss.Center, lipgloss.Center).
 			Render("No assignments in this classroom.")
-		return panelStyle(active).Width(inner).Height(innerH).Render(content)
+		return panelStyle(active).Width(inner).Height(innerH).Render(hdr + body)
 	}
 
-	urlLine := dimStyle.Width(inner).Render("Report URL: " + p.selectedURL)
-	content := p.list.View() + "\n" + urlLine
-	return panelStyle(active).Width(inner).Height(innerH).Render(content)
+	urlLine := dimStyle.Width(inner).Render("Report: " + p.selectedURL)
+	return panelStyle(active).Width(inner).Height(innerH).Render(hdr + p.list.View() + "\n" + urlLine)
 }

@@ -5,6 +5,7 @@ import (
 	"os/exec"
 	"runtime"
 	"strings"
+	"time"
 
 	"ghclassroom/internal/api"
 	"golang.design/x/clipboard"
@@ -20,9 +21,6 @@ const (
 	panelStudents
 	panelActivity
 )
-
-// Async result messages — each carries its own cache key so the handler
-// does not depend on the cursor position at the time the response arrives.
 
 type classroomsLoadedMsg struct {
 	classrooms []api.Classroom
@@ -48,6 +46,8 @@ type activityLoadedMsg struct {
 	err          error
 }
 
+type tickMsg time.Time
+
 type cache struct {
 	classrooms  []api.Classroom
 	assignments map[int][]api.Assignment
@@ -67,6 +67,8 @@ type Model struct {
 	students           StudentsPanel
 	activity           ActivityPanel
 	statusMsg          string
+	rateLimitReset     time.Time
+	showRateModal      bool
 }
 
 func New(token string, clipboardAvailable bool) Model {
@@ -98,17 +100,27 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 		w := m.panelWidths()
-		// setSize receives inner content dimensions (border = 2 per axis).
-		ch := max(0, m.height-3)
+		ch := max(0, m.height-6)
 		m.classrooms.setSize(max(0, w[0]-2), ch)
 		m.assignments.setSize(max(0, w[1]-2), ch)
 		m.students.setSize(max(0, w[2]-2), ch)
 		m.activity.setSize(max(0, w[3]-2), ch)
 		return m, nil
 
+	case tickMsg:
+		if !m.rateLimitReset.IsZero() && time.Now().Before(m.rateLimitReset) {
+			return m, tickCmd()
+		}
+		return m, nil
+
 	case classroomsLoadedMsg:
 		m.classrooms.loading = false
 		if msg.err != nil {
+			if rle, ok := api.AsRateLimitError(msg.err); ok {
+				m.rateLimitReset = rle.ResetAt
+				m.showRateModal = true
+				return m, tickCmd()
+			}
 			m.statusMsg = loadErrMsg(msg.err)
 			return m, nil
 		}
@@ -119,6 +131,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case assignmentsLoadedMsg:
 		m.assignments.loading = false
 		if msg.err != nil {
+			if rle, ok := api.AsRateLimitError(msg.err); ok {
+				m.rateLimitReset = rle.ResetAt
+				m.showRateModal = true
+				return m, tickCmd()
+			}
 			m.statusMsg = loadErrMsg(msg.err)
 			return m, nil
 		}
@@ -129,6 +146,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case studentsLoadedMsg:
 		m.students.loading = false
 		if msg.err != nil {
+			if rle, ok := api.AsRateLimitError(msg.err); ok {
+				m.rateLimitReset = rle.ResetAt
+				m.showRateModal = true
+				return m, tickCmd()
+			}
 			m.statusMsg = loadErrMsg(msg.err)
 			return m, nil
 		}
@@ -139,8 +161,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case activityLoadedMsg:
 		m.activity.loading = false
 		if msg.err != nil {
-			// Show the error inside the activity panel, not just the status bar.
-			// Do not write to cache — r must be able to retry.
+			if rle, ok := api.AsRateLimitError(msg.err); ok {
+				m.rateLimitReset = rle.ResetAt
+				m.showRateModal = true
+				m.activity.SetError(msg.err.Error())
+				return m, tickCmd()
+			}
 			m.activity.SetError(msg.err.Error())
 			if isUnauthorized(msg.err) {
 				m.statusMsg = unauthorizedMsg
@@ -153,8 +179,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.KeyMsg:
 		m.statusMsg = ""
-		// While the assignments filter is active, let the list consume all
-		// keystrokes (esc exits filter mode, enter applies it, etc.).
+		if m.showRateModal && msg.String() == "esc" {
+			m.showRateModal = false
+			return m, nil
+		}
 		if m.state == panelAssignments && m.assignments.IsFiltering() {
 			if msg.String() == "ctrl+c" {
 				return m, tea.Quit
@@ -200,28 +228,180 @@ func (m Model) View() string {
 		return ""
 	}
 
+	header := m.renderHeader()
 	statusBar := m.renderStatusBar()
-	// ch = inner content height; panels receive outer height = ch+2.
-	ch := max(0, m.height-3)
+	ch := max(0, m.height-6)
 	outerH := ch + 2
 
+	var row string
 	if m.width < 100 {
-		panel := m.activePanel(m.width, outerH)
-		return panel + "\n" + statusBar
+		row = m.activePanel(m.width, outerH)
+	} else {
+		w := m.panelWidths()
+		p0 := m.classrooms.View(m.state == panelClassrooms, w[0], outerH)
+		p1 := m.assignments.View(m.state == panelAssignments, w[1], outerH)
+		p2 := m.students.View(m.state == panelStudents, w[2], outerH)
+		p3 := m.activity.View(m.state == panelActivity, w[3], outerH)
+		row = lipgloss.JoinHorizontal(lipgloss.Top, p0, p1, p2, p3)
 	}
 
-	w := m.panelWidths()
-	p0 := m.classrooms.View(m.state == panelClassrooms, w[0], outerH)
-	p1 := m.assignments.View(m.state == panelAssignments, w[1], outerH)
-	p2 := m.students.View(m.state == panelStudents, w[2], outerH)
-	p3 := m.activity.View(m.state == panelActivity, w[3], outerH)
-
-	row := lipgloss.JoinHorizontal(lipgloss.Top, p0, p1, p2, p3)
-	return row + "\n" + statusBar
+	result := header + "\n" + row + "\n" + statusBar
+	if m.showRateModal {
+		result = m.applyRateModal(result)
+	}
+	return result
 }
 
-// panelWidths returns the outer column count allocated to each panel.
-// Ratios: 20% / 25% / 25% / 30%; last panel absorbs rounding remainder.
+func (m Model) renderHeader() string {
+	brand := amberStyle.Bold(true).Render("ghclassroom") + dimStyle.Render(" v0.1")
+
+	names := []string{"Classrooms", "Assignments", "Students", "Activity"}
+	states := []panelState{panelClassrooms, panelAssignments, panelStudents, panelActivity}
+	parts := make([]string, len(names))
+	for i, name := range names {
+		if states[i] == m.state {
+			parts[i] = amberStyle.Render(name)
+		} else {
+			parts[i] = dimStyle.Render(name)
+		}
+	}
+	crumbs := strings.Join(parts, dimStyle.Render(" › "))
+
+	var right string
+	if !m.rateLimitReset.IsZero() {
+		right = redStyle.Render("⚠ rate limited")
+	}
+
+	bw := lipgloss.Width(brand)
+	cw := lipgloss.Width(crumbs)
+	rw := lipgloss.Width(right)
+	space := m.width - bw - cw - rw
+	if space < 2 {
+		space = 2
+	}
+	leftPad := space / 2
+	rightPad := space - leftPad
+
+	line := brand + strings.Repeat(" ", leftPad) + crumbs + strings.Repeat(" ", rightPad) + right
+	sep := dimStyle.Render(strings.Repeat("╌", m.width))
+	return line + "\n" + sep
+}
+
+func (m Model) renderStatusBar() string {
+	sep := dimStyle.Render(strings.Repeat("╌", m.width))
+
+	var left string
+	if m.statusMsg != "" {
+		left = dimStyle.Render(m.statusMsg)
+	} else if !m.rateLimitReset.IsZero() {
+		remaining := time.Until(m.rateLimitReset)
+		if remaining > 0 {
+			mins := int(remaining.Minutes())
+			secs := int(remaining.Seconds()) % 60
+			left = redStyle.Render(fmt.Sprintf("Rate limit reached · resets in %d min %d s", mins, secs))
+		} else {
+			left = dimStyle.Render("Rate limit passed · press r to retry")
+		}
+	} else if url := m.currentURL(); url != "" {
+		left = amberStyle.Render(url)
+	}
+
+	right := m.keyHints()
+
+	lw := lipgloss.Width(left)
+	rw := lipgloss.Width(right)
+	gap := m.width - lw - rw
+	if gap < 1 {
+		gap = 1
+	}
+
+	bar := left + strings.Repeat(" ", gap) + right
+	return sep + "\n" + bar
+}
+
+func (m Model) keyHints() string {
+	k := func(key, desc string) string {
+		return amberStyle.Render(key) + dimStyle.Render(" "+desc)
+	}
+	join := func(hints ...string) string {
+		return strings.Join(hints, dimStyle.Render("  "))
+	}
+
+	if m.classrooms.loading {
+		return k("q", "quit")
+	}
+	switch m.state {
+	case panelClassrooms:
+		return join(k("↵", "drill in"), k("o", "open"), k("r", "refresh"), k("q", "quit"))
+	case panelAssignments:
+		return join(k("↵", "drill in"), k("/", "filter"), k("c", "copy"), k("o", "open"), k("esc", "back"))
+	case panelStudents:
+		return join(k("↵", "view activity"), k("c", "copy repo"), k("o", "open"), k("esc", "back"))
+	case panelActivity:
+		return join(k("o", "open repo"), k("c", "copy URL"), k("r", "refresh"), k("esc", "back"))
+	}
+	return k("q", "quit")
+}
+
+func (m Model) renderModalBox() string {
+	resetAt := m.rateLimitReset.UTC().Format("2006-01-02 15:04 UTC")
+	remaining := time.Until(m.rateLimitReset)
+
+	var countdown string
+	if remaining > 0 {
+		mins := int(remaining.Minutes())
+		secs := int(remaining.Seconds()) % 60
+		countdown = amberStyle.Render(fmt.Sprintf("(in %d min %d s)", mins, secs))
+	} else {
+		countdown = amberStyle.Render("(ready to retry)")
+	}
+
+	innerW := min(54, m.width-8)
+	content := redStyle.Bold(true).Render("⚠  Rate limit reached") + "\n\n" +
+		"GitHub API responded " + redStyle.Render("403") + "  " + dimStyle.Render("X-RateLimit-Remaining: 0") + "\n" +
+		"Resets at " + amberStyle.Render(resetAt) + "  " + countdown + "\n\n" +
+		dimStyle.Render("Cached panels remain available.\nPress ") + amberStyle.Render("r") + dimStyle.Render(" to retry after reset.") + "\n\n" +
+		amberStyle.Render("esc") + dimStyle.Render(" dismiss  ") + amberStyle.Render("q") + dimStyle.Render(" quit")
+
+	return lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("#f87171")).
+		Padding(0, 1).
+		Width(innerW).
+		Render(content)
+}
+
+// applyRateModal overlays the rate-limit modal box centered over the rendered view
+// using ANSI cursor-positioning sequences appended to the view string.
+func (m Model) applyRateModal(base string) string {
+	box := m.renderModalBox()
+	boxLines := strings.Split(box, "\n")
+	boxH := len(boxLines)
+	boxW := 0
+	for _, l := range boxLines {
+		if w := lipgloss.Width(l); w > boxW {
+			boxW = w
+		}
+	}
+
+	startRow := (m.height-boxH)/2 + 1
+	startCol := (m.width - boxW) / 2
+	if startRow < 3 {
+		startRow = 3
+	}
+	if startCol < 0 {
+		startCol = 0
+	}
+
+	var sb strings.Builder
+	sb.WriteString(base)
+	for i, line := range boxLines {
+		sb.WriteString(fmt.Sprintf("\033[%d;%dH", startRow+i+1, startCol+1))
+		sb.WriteString(line)
+	}
+	return sb.String()
+}
+
 func (m Model) panelWidths() [4]int {
 	w := [4]int{
 		int(float64(m.width) * 0.20),
@@ -233,7 +413,6 @@ func (m Model) panelWidths() [4]int {
 	return w
 }
 
-// activePanel renders only the active panel (used when width < 100).
 func (m Model) activePanel(width, height int) string {
 	switch m.state {
 	case panelClassrooms:
@@ -246,14 +425,6 @@ func (m Model) activePanel(width, height int) string {
 		return m.activity.View(true, width, height)
 	}
 	return ""
-}
-
-func (m Model) renderStatusBar() string {
-	msg := m.statusMsg
-	if msg == "" {
-		msg = "↑↓ navigate  enter select  esc back  o open  c copy  r refresh  q quit"
-	}
-	return statusBarStyle.Width(m.width).Render(msg)
 }
 
 func (m Model) handleForward() (tea.Model, tea.Cmd) {
@@ -294,7 +465,7 @@ func (m Model) handleForward() (tea.Model, tea.Cmd) {
 			m.activity.SetActivity(cached, s.Repository.FullName, s.Repository.HTMLURL)
 			return m, nil
 		}
-		m.activity.loading = true
+		m.activity.startLoading()
 		return m, tea.Batch(
 			loadActivityCmd(m.token, s.Repository.FullName, s.Repository.HTMLURL),
 			m.activity.spinner.Tick,
@@ -340,7 +511,7 @@ func (m Model) handleRefresh() (tea.Model, tea.Cmd) {
 	case panelActivity:
 		if s := m.students.SelectedItem(); s != nil {
 			delete(m.cache.activity, s.Repository.FullName)
-			m.activity.loading = true
+			m.activity.startLoading()
 			return m, tea.Batch(
 				loadActivityCmd(m.token, s.Repository.FullName, s.Repository.HTMLURL),
 				m.activity.spinner.Tick,
@@ -351,7 +522,6 @@ func (m Model) handleRefresh() (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// currentURL returns the URL for the "o" (open in browser) key.
 func (m Model) currentURL() string {
 	switch m.state {
 	case panelClassrooms:
@@ -370,8 +540,6 @@ func (m Model) currentURL() string {
 	return ""
 }
 
-// currentCopyURL returns the URL for the "c" (copy) key.
-// Assignments and students panels copy the report URL; activity copies the repo URL.
 func (m Model) currentCopyURL() string {
 	switch m.state {
 	case panelAssignments, panelStudents:
@@ -397,22 +565,22 @@ func (m Model) routeToActivePanel(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
-// Package-level styles used by all panels and the status bar.
 var (
 	activePanelStyle = lipgloss.NewStyle().
 				Border(lipgloss.RoundedBorder()).
-				BorderForeground(lipgloss.Color("62"))
+				BorderForeground(lipgloss.Color("#f59e0b"))
 
 	inactivePanelStyle = lipgloss.NewStyle().
 				Border(lipgloss.RoundedBorder()).
-				BorderForeground(lipgloss.Color("240")).
-				Foreground(lipgloss.Color("240"))
+				BorderForeground(lipgloss.Color("240"))
 
-	statusBarStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("241"))
-
-	// dimStyle is used inline in panel content (description text, URL line).
-	dimStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
+	dimStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
+	amberStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("#f59e0b"))
+	cyanStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#67e8f9"))
+	greenStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("#4ade80"))
+	redStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("#f87171"))
+	blueStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#60a5fa"))
+	purpleStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#c084fc"))
 )
 
 func panelStyle(active bool) lipgloss.Style {
@@ -422,19 +590,42 @@ func panelStyle(active bool) lipgloss.Style {
 	return inactivePanelStyle
 }
 
+// renderPanelHeader produces a 2-row panel title (NAME + count / dashed separator + trailing newline).
+func renderPanelHeader(name, count string, active bool, w int) string {
+	var nameStr string
+	if active {
+		nameStr = amberStyle.Bold(true).Render(strings.ToUpper(name))
+	} else {
+		nameStr = dimStyle.Render(strings.ToUpper(name))
+	}
+	countStr := dimStyle.Render(count)
+
+	nw := lipgloss.Width(nameStr)
+	cw := lipgloss.Width(countStr)
+	pad := w - nw - cw
+	if pad < 1 {
+		pad = 1
+	}
+	row := nameStr + strings.Repeat(" ", pad) + countStr
+	sep := dimStyle.Render(strings.Repeat("╌", w))
+	return row + "\n" + sep + "\n"
+}
+
 const unauthorizedMsg = "Token unauthorized. Run ghclassroom with --reconfigure to reset."
 
-// isUnauthorized reports whether an API error is a 401.
 func isUnauthorized(err error) bool {
 	return strings.HasPrefix(err.Error(), "GitHub API 401")
 }
 
-// loadErrMsg returns the user-facing message for a load error.
 func loadErrMsg(err error) string {
 	if isUnauthorized(err) {
 		return unauthorizedMsg
 	}
 	return err.Error()
+}
+
+func tickCmd() tea.Cmd {
+	return tea.Tick(time.Second, func(t time.Time) tea.Msg { return tickMsg(t) })
 }
 
 func openURL(url string) error {
@@ -449,8 +640,6 @@ func openURL(url string) error {
 	}
 	return exec.Command(cmd, url).Start()
 }
-
-// Async commands — each wraps its identifying key in the result message.
 
 func loadClassroomsCmd(token string) tea.Cmd {
 	return func() tea.Msg {

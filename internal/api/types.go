@@ -1,5 +1,23 @@
 package api
 
+import (
+	"errors"
+	"time"
+)
+
+type RateLimitError struct {
+	ResetAt time.Time
+}
+
+func (e *RateLimitError) Error() string {
+	return "rate limit reached, resets at " + e.ResetAt.UTC().Format("2006-01-02 15:04 UTC")
+}
+
+func AsRateLimitError(err error) (*RateLimitError, bool) {
+	var rle *RateLimitError
+	return rle, errors.As(err, &rle)
+}
+
 type Classroom struct {
 	ID   int    `json:"id"`
 	Name string `json:"name"`
