@@ -1,3 +1,5 @@
+[![CI](https://github.com/juzor/ghclassroom/actions/workflows/ci.yml/badge.svg)](https://github.com/juzor/ghclassroom/actions/workflows/ci.yml)
+
 # ghclassroom
 
 Terminal UI for browsing GitHub Classroom — classrooms, assignments, student submissions, and repo activity.
