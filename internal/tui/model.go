@@ -13,15 +13,6 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
-type panelState int
-
-const (
-	panelClassrooms panelState = iota
-	panelAssignments
-	panelStudents
-	panelActivity
-)
-
 type classroomsLoadedMsg struct {
 	classrooms []api.Classroom
 	err        error
@@ -58,40 +49,33 @@ type cache struct {
 type Model struct {
 	token              string
 	clipboardAvailable bool
-	state              panelState
+	contentFocus       bool
 	width              int
 	height             int
 	cache              cache
-	classrooms         ClassroomsPanel
-	assignments        AssignmentsPanel
-	students           StudentsPanel
-	activity           ActivityPanel
+	sidebar            Sidebar
+	content            ContentPanel
 	statusMsg          string
 	rateLimitReset     time.Time
 	showRateModal      bool
 }
 
 func New(token string, clipboardAvailable bool) Model {
-	m := Model{
+	return Model{
 		token:              token,
 		clipboardAvailable: clipboardAvailable,
-		state:              panelClassrooms,
 		cache: cache{
 			assignments: make(map[int][]api.Assignment),
 			students:    make(map[int][]api.AcceptedAssignment),
 			activity:    make(map[string]*api.RepoActivity),
 		},
-		classrooms:  newClassroomsPanel(),
-		assignments: newAssignmentsPanel(),
-		students:    newStudentsPanel(),
-		activity:    newActivityPanel(),
+		sidebar: newSidebar(),
+		content: newContentPanel(),
 	}
-	m.classrooms.loading = true
-	return m
 }
 
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(loadClassroomsCmd(m.token), m.classrooms.spinner.Tick)
+	return tea.Batch(loadClassroomsCmd(m.token), m.sidebar.spinner.Tick)
 }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -99,12 +83,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
-		w := m.panelWidths()
-		ch := max(0, m.height-6)
-		m.classrooms.setSize(max(0, w[0]-2), ch)
-		m.assignments.setSize(max(0, w[1]-2), ch)
-		m.students.setSize(max(0, w[2]-2), ch)
-		m.activity.setSize(max(0, w[3]-2), ch)
+		m.updateSizes()
 		return m, nil
 
 	case tickMsg:
@@ -114,7 +93,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case classroomsLoadedMsg:
-		m.classrooms.loading = false
 		if msg.err != nil {
 			if rle, ok := api.AsRateLimitError(msg.err); ok {
 				m.rateLimitReset = rle.ResetAt
@@ -125,11 +103,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.cache.classrooms = msg.classrooms
-		m.classrooms.SetItems(msg.classrooms)
-		return m, nil
+		m.sidebar.SetClassrooms(msg.classrooms)
+		return m.updateContentForSelection()
 
 	case assignmentsLoadedMsg:
-		m.assignments.loading = false
 		if msg.err != nil {
 			if rle, ok := api.AsRateLimitError(msg.err); ok {
 				m.rateLimitReset = rle.ResetAt
@@ -140,11 +117,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.cache.assignments[msg.classroomID] = msg.assignments
-		m.assignments.SetItems(msg.classroomID, msg.assignments)
-		return m, nil
+		m.sidebar.SetAssignments(msg.classroomID, msg.assignments)
+		return m.updateContentForSelection()
 
 	case studentsLoadedMsg:
-		m.students.loading = false
 		if msg.err != nil {
 			if rle, ok := api.AsRateLimitError(msg.err); ok {
 				m.rateLimitReset = rle.ResetAt
@@ -155,47 +131,54 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.cache.students[msg.assignmentID] = msg.students
-		m.students.SetItems(msg.assignmentID, msg.students)
-		return m, nil
+		m.sidebar.SetStudents(msg.assignmentID, msg.students)
+		return m.updateContentForSelection()
 
 	case activityLoadedMsg:
-		m.activity.loading = false
 		if msg.err != nil {
 			if rle, ok := api.AsRateLimitError(msg.err); ok {
 				m.rateLimitReset = rle.ResetAt
 				m.showRateModal = true
-				m.activity.SetError(msg.err.Error())
+				m.content.SetError(msg.err.Error())
 				return m, tickCmd()
 			}
-			m.activity.SetError(msg.err.Error())
+			m.content.SetError(msg.err.Error())
 			if isUnauthorized(msg.err) {
 				m.statusMsg = unauthorizedMsg
 			}
 			return m, nil
 		}
 		m.cache.activity[msg.repoFullName] = msg.activity
-		m.activity.SetActivity(msg.activity, msg.repoFullName, msg.repoURL)
+		if n := m.sidebar.SelectedNode(); n != nil && n.kind == nodeStudent &&
+			n.student.Repository.FullName == msg.repoFullName {
+			m.content.ShowActivity(msg.activity, msg.repoFullName, msg.repoURL)
+		}
 		return m, nil
 
 	case tea.KeyMsg:
 		m.statusMsg = ""
-		if m.showRateModal && msg.String() == "esc" {
-			m.showRateModal = false
-			return m, nil
+
+		// Filter mode intercepts most keys
+		if m.sidebar.filterActive {
+			return m.handleFilterKeys(msg)
 		}
-		if m.state == panelAssignments && m.assignments.IsFiltering() {
-			if msg.String() == "ctrl+c" {
+
+		if m.showRateModal {
+			switch msg.String() {
+			case "esc":
+				m.showRateModal = false
+			case "q", "ctrl+c":
 				return m, tea.Quit
 			}
-			return m.routeToActivePanel(msg)
+			return m, nil
 		}
+
 		switch msg.String() {
 		case "q", "ctrl+c":
 			return m, tea.Quit
-		case "right", "enter":
-			return m.handleForward()
-		case "left", "esc":
-			return m.handleBack()
+		case "tab":
+			m.contentFocus = !m.contentFocus
+			return m, nil
 		case "r":
 			return m.handleRefresh()
 		case "o":
@@ -218,9 +201,212 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		}
+
+		if m.contentFocus {
+			return m.handleContentKeys(msg)
+		}
+		return m.handleSidebarKeys(msg)
 	}
 
-	return m.routeToActivePanel(msg)
+	var cmds []tea.Cmd
+	var cmd tea.Cmd
+	m.sidebar, cmd = m.sidebar.Update(msg)
+	cmds = append(cmds, cmd)
+	m.content, cmd = m.content.Update(msg)
+	cmds = append(cmds, cmd)
+	return m, tea.Batch(cmds...)
+}
+
+func (m Model) handleFilterKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc":
+		m.sidebar.ExitFilter()
+		return m.updateContentForSelection()
+	case "enter":
+		m.sidebar.filterActive = false
+		return m.updateContentForSelection()
+	case "backspace", "ctrl+h":
+		m.sidebar.FilterBackspace()
+	case "ctrl+c":
+		return m, tea.Quit
+	default:
+		// Append printable rune
+		runes := []rune(msg.String())
+		if len(runes) == 1 && runes[0] >= 32 {
+			m.sidebar.FilterAppend(runes[0])
+		}
+	}
+	return m, nil
+}
+
+func (m Model) handleSidebarKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "up", "k":
+		prev := m.sidebar.SelectedNode()
+		m.sidebar.MoveUp()
+		if m.sidebar.SelectedNode() != prev {
+			return m.updateContentForSelection()
+		}
+	case "down", "j":
+		prev := m.sidebar.SelectedNode()
+		m.sidebar.MoveDown()
+		if m.sidebar.SelectedNode() != prev {
+			return m.updateContentForSelection()
+		}
+	case "enter", "right", "l":
+		return m.handleActivate()
+	case "left", "h", "esc", "-":
+		m.sidebar.Collapse()
+		return m.updateContentForSelection()
+	case "/":
+		m.sidebar.EnterFilter()
+	}
+	return m, nil
+}
+
+func (m Model) handleContentKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc":
+		m.contentFocus = false
+		return m, nil
+	}
+	var cmd tea.Cmd
+	m.content, cmd = m.content.Update(msg)
+	return m, cmd
+}
+
+func (m Model) handleActivate() (tea.Model, tea.Cmd) {
+	n := m.sidebar.Expand()
+	if n == nil {
+		return m.updateContentForSelection()
+	}
+
+	switch n.kind {
+	case nodeClassroom:
+		if cached, ok := m.cache.assignments[n.classroom.ID]; ok {
+			n.loading = false
+			m.sidebar.SetAssignments(n.classroom.ID, cached)
+			return m.updateContentForSelection()
+		}
+		m2, contentCmd := m.updateContentForSelection()
+		return m2, tea.Batch(
+			loadAssignmentsCmd(m2.token, n.classroom.ID),
+			m2.sidebar.spinner.Tick,
+			contentCmd,
+		)
+	case nodeAssignment:
+		if cached, ok := m.cache.students[n.assignment.ID]; ok {
+			n.loading = false
+			m.sidebar.SetStudents(n.assignment.ID, cached)
+			return m.updateContentForSelection()
+		}
+		m2, contentCmd := m.updateContentForSelection()
+		return m2, tea.Batch(
+			loadStudentsCmd(m2.token, n.assignment.ID),
+			m2.sidebar.spinner.Tick,
+			contentCmd,
+		)
+	case nodeStudent:
+		// Load activity on explicit activation (not on cursor move)
+		if cached, ok := m.cache.activity[n.student.Repository.FullName]; ok {
+			m.content.ShowActivity(cached, n.student.Repository.FullName, n.student.Repository.HTMLURL)
+			return m, nil
+		}
+		m.content.StartLoadingActivity(n.student.Repository.HTMLURL)
+		return m, tea.Batch(
+			loadActivityCmd(m.token, n.student.Repository.FullName, n.student.Repository.HTMLURL),
+			m.content.spinner.Tick,
+		)
+	}
+	return m, nil
+}
+
+// updateContentForSelection refreshes the content pane to match the current cursor.
+// For student nodes it shows a preview; activity loads only on explicit ↵.
+func (m Model) updateContentForSelection() (Model, tea.Cmd) {
+	n := m.sidebar.SelectedNode()
+	if n == nil {
+		return m, nil
+	}
+	switch n.kind {
+	case nodeClassroom:
+		assignments := m.cache.assignments[n.classroom.ID]
+		m.content.ShowClassroom(n.classroom, len(assignments), len(assignments) > 0)
+	case nodeAssignment:
+		students := m.cache.students[n.assignment.ID]
+		var submitted int
+		for _, s := range students {
+			if s.Submitted {
+				submitted++
+			}
+		}
+		classroomID := 0
+		if n.parent != nil {
+			classroomID = n.parent.classroom.ID
+		}
+		m.content.ShowAssignment(n.assignment, classroomID, len(students), submitted, len(students) > 0)
+	case nodeStudent:
+		// Show preview — don't auto-load activity; user presses ↵ for that
+		if cached, ok := m.cache.activity[n.student.Repository.FullName]; ok {
+			m.content.ShowActivity(cached, n.student.Repository.FullName, n.student.Repository.HTMLURL)
+			return m, nil
+		}
+		m.content.ShowStudentPreview(n.student)
+	}
+	return m, nil
+}
+
+func (m Model) handleRefresh() (tea.Model, tea.Cmd) {
+	n := m.sidebar.SelectedNode()
+	if n == nil {
+		return m.refreshClassrooms()
+	}
+	switch n.kind {
+	case nodeClassroom:
+		return m.refreshClassrooms()
+	case nodeAssignment:
+		if n.parent == nil {
+			return m, nil
+		}
+		clID := n.parent.classroom.ID
+		delete(m.cache.assignments, clID)
+		n.parent.loading = true
+		n.parent.children = nil
+		n.parent.expanded = true
+		return m, tea.Batch(loadAssignmentsCmd(m.token, clID), m.sidebar.spinner.Tick)
+	case nodeStudent:
+		if n.parent == nil {
+			return m, nil
+		}
+		aID := n.parent.assignment.ID
+		delete(m.cache.students, aID)
+		n.parent.loading = true
+		n.parent.children = nil
+		n.parent.expanded = true
+		return m, tea.Batch(loadStudentsCmd(m.token, aID), m.sidebar.spinner.Tick)
+	}
+	return m, nil
+}
+
+func (m Model) refreshClassrooms() (tea.Model, tea.Cmd) {
+	m.cache.classrooms = nil
+	m.sidebar.roots = nil
+	m.sidebar.loading = true
+	m.sidebar.cursor = 0
+	m.sidebar.offset = 0
+	return m, tea.Batch(loadClassroomsCmd(m.token), m.sidebar.spinner.Tick)
+}
+
+func (m *Model) updateSizes() {
+	ch := max(0, m.height-6)
+	outerH := ch + 2
+	sideW := int(float64(m.width) * 0.28)
+	if sideW < 20 {
+		sideW = 20
+	}
+	contentW := m.width - sideW
+	m.sidebar.setSize(sideW, outerH)
+	m.content.setSize(contentW, outerH)
 }
 
 func (m Model) View() string {
@@ -230,20 +416,10 @@ func (m Model) View() string {
 
 	header := m.renderHeader()
 	statusBar := m.renderStatusBar()
-	ch := max(0, m.height-6)
-	outerH := ch + 2
 
-	var row string
-	if m.width < 100 {
-		row = m.activePanel(m.width, outerH)
-	} else {
-		w := m.panelWidths()
-		p0 := m.classrooms.View(m.state == panelClassrooms, w[0], outerH)
-		p1 := m.assignments.View(m.state == panelAssignments, w[1], outerH)
-		p2 := m.students.View(m.state == panelStudents, w[2], outerH)
-		p3 := m.activity.View(m.state == panelActivity, w[3], outerH)
-		row = lipgloss.JoinHorizontal(lipgloss.Top, p0, p1, p2, p3)
-	}
+	sidebarView := m.sidebar.View(!m.contentFocus)
+	contentView := m.content.View(m.contentFocus)
+	row := lipgloss.JoinHorizontal(lipgloss.Top, sidebarView, contentView)
 
 	result := header + "\n" + row + "\n" + statusBar
 	if m.showRateModal {
@@ -254,18 +430,7 @@ func (m Model) View() string {
 
 func (m Model) renderHeader() string {
 	brand := amberStyle.Bold(true).Render("ghclassroom") + dimStyle.Render(" v0.1")
-
-	names := []string{"Classrooms", "Assignments", "Students", "Activity"}
-	states := []panelState{panelClassrooms, panelAssignments, panelStudents, panelActivity}
-	parts := make([]string, len(names))
-	for i, name := range names {
-		if states[i] == m.state {
-			parts[i] = amberStyle.Render(name)
-		} else {
-			parts[i] = dimStyle.Render(name)
-		}
-	}
-	crumbs := strings.Join(parts, dimStyle.Render(" › "))
+	crumbs := m.breadcrumb()
 
 	var right string
 	if !m.rateLimitReset.IsZero() {
@@ -285,6 +450,36 @@ func (m Model) renderHeader() string {
 	line := brand + strings.Repeat(" ", leftPad) + crumbs + strings.Repeat(" ", rightPad) + right
 	sep := dimStyle.Render(strings.Repeat("╌", m.width))
 	return line + "\n" + sep
+}
+
+func (m Model) breadcrumb() string {
+	levels := [4]string{"Classrooms", "Assignments", "Students", "Activity"}
+	active := 0
+	n := m.sidebar.SelectedNode()
+	if n != nil {
+		switch n.kind {
+		case nodeClassroom:
+			active = 0
+		case nodeAssignment:
+			active = 1
+		case nodeStudent:
+			if m.content.IsActivityLoaded() {
+				active = 3
+			} else {
+				active = 2
+			}
+		}
+	}
+	sep := dimStyle.Render(" › ")
+	strs := make([]string, len(levels))
+	for i, l := range levels {
+		if i == active {
+			strs[i] = amberStyle.Render(l)
+		} else {
+			strs[i] = dimStyle.Render(l)
+		}
+	}
+	return strings.Join(strs[:], sep)
 }
 
 func (m Model) renderStatusBar() string {
@@ -307,7 +502,6 @@ func (m Model) renderStatusBar() string {
 	}
 
 	right := m.keyHints()
-
 	lw := lipgloss.Width(left)
 	rw := lipgloss.Width(right)
 	gap := m.width - lw - rw
@@ -327,20 +521,66 @@ func (m Model) keyHints() string {
 		return strings.Join(hints, dimStyle.Render("  "))
 	}
 
-	if m.classrooms.loading {
-		return k("q", "quit")
+	if m.sidebar.filterActive {
+		return join(k("↵", "confirm"), k("esc", "cancel"))
 	}
-	switch m.state {
-	case panelClassrooms:
-		return join(k("↵", "drill in"), k("o", "open"), k("r", "refresh"), k("q", "quit"))
-	case panelAssignments:
-		return join(k("↵", "drill in"), k("/", "filter"), k("c", "copy"), k("o", "open"), k("esc", "back"))
-	case panelStudents:
-		return join(k("↵", "view activity"), k("c", "copy repo"), k("o", "open"), k("esc", "back"))
-	case panelActivity:
-		return join(k("o", "open repo"), k("c", "copy URL"), k("r", "refresh"), k("esc", "back"))
+	if m.contentFocus {
+		return join(k("↑↓", "scroll"), k("tab", "sidebar"), k("q", "quit"))
 	}
-	return k("q", "quit")
+	n := m.sidebar.SelectedNode()
+	if n == nil || m.sidebar.loading {
+		return join(k("r", "retry"), k("q", "quit"))
+	}
+	switch n.kind {
+	case nodeClassroom:
+		return join(k("↵", "expand"), k("-", "collapse"), k("o", "open"), k("r", "refresh"), k("q", "quit"))
+	case nodeAssignment:
+		return join(k("↵", "expand"), k("-", "collapse"), k("/", "filter"), k("c", "copy URL"), k("o", "open"), k("q", "quit"))
+	case nodeStudent:
+		if m.content.IsActivityLoaded() {
+			return join(k("↵", "view activity"), k("tab", "scroll"), k("o", "open repo"), k("c", "copy"), k("q", "quit"))
+		}
+		return join(k("↵", "view activity"), k("o", "open"), k("c", "copy"), k("q", "quit"))
+	}
+	return join(k("↑↓", "navigate"), k("q", "quit"))
+}
+
+func (m Model) currentURL() string {
+	n := m.sidebar.SelectedNode()
+	if n == nil {
+		return ""
+	}
+	switch n.kind {
+	case nodeClassroom:
+		return n.classroom.URL
+	case nodeAssignment:
+		if n.parent != nil {
+			return api.ReportURL(n.parent.classroom.ID, n.assignment.ID)
+		}
+	case nodeStudent:
+		return n.student.Repository.HTMLURL
+	}
+	return ""
+}
+
+func (m Model) currentCopyURL() string {
+	n := m.sidebar.SelectedNode()
+	if n == nil {
+		return ""
+	}
+	switch n.kind {
+	case nodeAssignment:
+		if n.parent != nil {
+			return api.ReportURL(n.parent.classroom.ID, n.assignment.ID)
+		}
+	case nodeStudent:
+		// Copy assignment report URL (parent) when on student node
+		if n.parent != nil && n.parent.parent != nil {
+			return api.ReportURL(n.parent.parent.classroom.ID, n.parent.assignment.ID)
+		}
+		return n.student.Repository.HTMLURL
+	}
+	return ""
 }
 
 func (m Model) renderModalBox() string {
@@ -360,7 +600,7 @@ func (m Model) renderModalBox() string {
 	content := redStyle.Bold(true).Render("⚠  Rate limit reached") + "\n\n" +
 		"GitHub API responded " + redStyle.Render("403") + "  " + dimStyle.Render("X-RateLimit-Remaining: 0") + "\n" +
 		"Resets at " + amberStyle.Render(resetAt) + "  " + countdown + "\n\n" +
-		dimStyle.Render("Cached panels remain available.\nPress ") + amberStyle.Render("r") + dimStyle.Render(" to retry after reset.") + "\n\n" +
+		dimStyle.Render("Cached tree state remains available.\nPress ") + amberStyle.Render("r") + dimStyle.Render(" to retry after reset.") + "\n\n" +
 		amberStyle.Render("esc") + dimStyle.Render(" dismiss  ") + amberStyle.Render("q") + dimStyle.Render(" quit")
 
 	return lipgloss.NewStyle().
@@ -371,8 +611,6 @@ func (m Model) renderModalBox() string {
 		Render(content)
 }
 
-// applyRateModal overlays the rate-limit modal box centered over the rendered view
-// using ANSI cursor-positioning sequences appended to the view string.
 func (m Model) applyRateModal(base string) string {
 	box := m.renderModalBox()
 	boxLines := strings.Split(box, "\n")
@@ -402,169 +640,6 @@ func (m Model) applyRateModal(base string) string {
 	return sb.String()
 }
 
-func (m Model) panelWidths() [4]int {
-	w := [4]int{
-		int(float64(m.width) * 0.20),
-		int(float64(m.width) * 0.25),
-		int(float64(m.width) * 0.25),
-		0,
-	}
-	w[3] = m.width - w[0] - w[1] - w[2]
-	return w
-}
-
-func (m Model) activePanel(width, height int) string {
-	switch m.state {
-	case panelClassrooms:
-		return m.classrooms.View(true, width, height)
-	case panelAssignments:
-		return m.assignments.View(true, width, height)
-	case panelStudents:
-		return m.students.View(true, width, height)
-	case panelActivity:
-		return m.activity.View(true, width, height)
-	}
-	return ""
-}
-
-func (m Model) handleForward() (tea.Model, tea.Cmd) {
-	switch m.state {
-	case panelClassrooms:
-		cl := m.classrooms.SelectedItem()
-		if cl == nil {
-			return m, nil
-		}
-		m.state = panelAssignments
-		if cached, ok := m.cache.assignments[cl.ID]; ok {
-			m.assignments.SetItems(cl.ID, cached)
-			return m, nil
-		}
-		m.assignments.loading = true
-		return m, tea.Batch(loadAssignmentsCmd(m.token, cl.ID), m.assignments.spinner.Tick)
-
-	case panelAssignments:
-		a := m.assignments.SelectedItem()
-		if a == nil {
-			return m, nil
-		}
-		m.state = panelStudents
-		if cached, ok := m.cache.students[a.ID]; ok {
-			m.students.SetItems(a.ID, cached)
-			return m, nil
-		}
-		m.students.loading = true
-		return m, tea.Batch(loadStudentsCmd(m.token, a.ID), m.students.spinner.Tick)
-
-	case panelStudents:
-		s := m.students.SelectedItem()
-		if s == nil {
-			return m, nil
-		}
-		m.state = panelActivity
-		if cached, ok := m.cache.activity[s.Repository.FullName]; ok {
-			m.activity.SetActivity(cached, s.Repository.FullName, s.Repository.HTMLURL)
-			return m, nil
-		}
-		m.activity.startLoading()
-		return m, tea.Batch(
-			loadActivityCmd(m.token, s.Repository.FullName, s.Repository.HTMLURL),
-			m.activity.spinner.Tick,
-		)
-	}
-
-	return m, nil
-}
-
-func (m Model) handleBack() (tea.Model, tea.Cmd) {
-	switch m.state {
-	case panelAssignments:
-		m.state = panelClassrooms
-	case panelStudents:
-		m.state = panelAssignments
-	case panelActivity:
-		m.state = panelStudents
-	}
-	return m, nil
-}
-
-func (m Model) handleRefresh() (tea.Model, tea.Cmd) {
-	switch m.state {
-	case panelClassrooms:
-		m.cache.classrooms = nil
-		m.classrooms.loading = true
-		return m, tea.Batch(loadClassroomsCmd(m.token), m.classrooms.spinner.Tick)
-
-	case panelAssignments:
-		if cl := m.classrooms.SelectedItem(); cl != nil {
-			delete(m.cache.assignments, cl.ID)
-			m.assignments.loading = true
-			return m, tea.Batch(loadAssignmentsCmd(m.token, cl.ID), m.assignments.spinner.Tick)
-		}
-
-	case panelStudents:
-		if a := m.assignments.SelectedItem(); a != nil {
-			delete(m.cache.students, a.ID)
-			m.students.loading = true
-			return m, tea.Batch(loadStudentsCmd(m.token, a.ID), m.students.spinner.Tick)
-		}
-
-	case panelActivity:
-		if s := m.students.SelectedItem(); s != nil {
-			delete(m.cache.activity, s.Repository.FullName)
-			m.activity.startLoading()
-			return m, tea.Batch(
-				loadActivityCmd(m.token, s.Repository.FullName, s.Repository.HTMLURL),
-				m.activity.spinner.Tick,
-			)
-		}
-	}
-
-	return m, nil
-}
-
-func (m Model) currentURL() string {
-	switch m.state {
-	case panelClassrooms:
-		if cl := m.classrooms.SelectedItem(); cl != nil {
-			return cl.URL
-		}
-	case panelAssignments:
-		return m.assignments.SelectedReportURL()
-	case panelStudents:
-		if s := m.students.SelectedItem(); s != nil {
-			return s.Repository.HTMLURL
-		}
-	case panelActivity:
-		return m.activity.RepoURL()
-	}
-	return ""
-}
-
-func (m Model) currentCopyURL() string {
-	switch m.state {
-	case panelAssignments, panelStudents:
-		return m.assignments.SelectedReportURL()
-	case panelActivity:
-		return m.activity.RepoURL()
-	}
-	return ""
-}
-
-func (m Model) routeToActivePanel(msg tea.Msg) (tea.Model, tea.Cmd) {
-	var cmd tea.Cmd
-	switch m.state {
-	case panelClassrooms:
-		m.classrooms, cmd = m.classrooms.Update(msg)
-	case panelAssignments:
-		m.assignments, cmd = m.assignments.Update(msg)
-	case panelStudents:
-		m.students, cmd = m.students.Update(msg)
-	case panelActivity:
-		m.activity, cmd = m.activity.Update(msg)
-	}
-	return m, cmd
-}
-
 var (
 	activePanelStyle = lipgloss.NewStyle().
 				Border(lipgloss.RoundedBorder()).
@@ -590,7 +665,6 @@ func panelStyle(active bool) lipgloss.Style {
 	return inactivePanelStyle
 }
 
-// renderPanelHeader produces a 2-row panel title (NAME + count / dashed separator + trailing newline).
 func renderPanelHeader(name, count string, active bool, w int) string {
 	var nameStr string
 	if active {
