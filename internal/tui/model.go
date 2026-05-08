@@ -4,11 +4,14 @@ import (
 	"fmt"
 	"os/exec"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
 	"ghclassroom/internal/api"
+	"ghclassroom/internal/classifier"
 	"golang.design/x/clipboard"
+	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
@@ -37,6 +40,11 @@ type activityLoadedMsg struct {
 	err          error
 }
 
+type allActivitiesLoadedMsg struct {
+	assignmentID int
+	activities   map[string]*api.RepoActivity
+}
+
 type tickMsg time.Time
 
 type cache struct {
@@ -44,30 +52,37 @@ type cache struct {
 	assignments map[int][]api.Assignment
 	students    map[int][]api.AcceptedAssignment
 	activity    map[string]*api.RepoActivity
+	statuses    map[int][]classifier.StudentStatus
 }
 
 type Model struct {
 	token              string
 	clipboardAvailable bool
+	thresholdDays      int
 	contentFocus       bool
 	width              int
 	height             int
 	cache              cache
 	sidebar            Sidebar
 	content            ContentPanel
-	statusMsg          string
-	rateLimitReset     time.Time
-	showRateModal      bool
+	statusMsg             string
+	allActivitiesLoading  bool
+	thresholdInput        textinput.Model
+	thresholdInputActive  bool
+	rateLimitReset        time.Time
+	showRateModal         bool
 }
 
-func New(token string, clipboardAvailable bool) Model {
+func New(token string, clipboardAvailable bool, thresholdDays int) Model {
 	return Model{
 		token:              token,
 		clipboardAvailable: clipboardAvailable,
+		thresholdDays:      thresholdDays,
 		cache: cache{
 			assignments: make(map[int][]api.Assignment),
 			students:    make(map[int][]api.AcceptedAssignment),
 			activity:    make(map[string]*api.RepoActivity),
+			statuses:    make(map[int][]classifier.StudentStatus),
 		},
 		sidebar: newSidebar(),
 		content: newContentPanel(),
@@ -132,7 +147,28 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.cache.students[msg.assignmentID] = msg.students
 		m.sidebar.SetStudents(msg.assignmentID, msg.students)
-		return m.updateContentForSelection()
+		m.allActivitiesLoading = true
+		m2, contentCmd := m.updateContentForSelection()
+		return m2, tea.Batch(
+			contentCmd,
+			loadAllActivitiesCmd(m2.token, msg.assignmentID, msg.students),
+		)
+
+	case allActivitiesLoadedMsg:
+		for k, v := range msg.activities {
+			if _, exists := m.cache.activity[k]; !exists {
+				m.cache.activity[k] = v
+			}
+		}
+		statuses := classifier.Classify(
+			m.cache.students[msg.assignmentID],
+			m.cache.activity,
+			m.thresholdDays,
+		)
+		m.cache.statuses[msg.assignmentID] = statuses
+		m.sidebar.ApplyStatuses(msg.assignmentID, statuses)
+		m.allActivitiesLoading = false
+		return m, nil
 
 	case activityLoadedMsg:
 		if msg.err != nil {
@@ -151,11 +187,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.cache.activity[msg.repoFullName] = msg.activity
 		if n := m.sidebar.SelectedNode(); n != nil && n.kind == nodeStudent &&
 			n.student.Repository.FullName == msg.repoFullName {
-			m.content.ShowActivity(msg.activity, msg.repoFullName, msg.repoURL)
+			m.content.ShowActivity(msg.activity, msg.repoFullName, msg.repoURL, m.statusForNode(n))
 		}
 		return m, nil
 
 	case tea.KeyMsg:
+		// Threshold input suppresses everything else while active.
+		if m.thresholdInputActive {
+			return m.handleThresholdInputKeys(msg)
+		}
+
 		m.statusMsg = ""
 
 		// Filter mode intercepts most keys
@@ -210,6 +251,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	var cmds []tea.Cmd
 	var cmd tea.Cmd
+	if m.thresholdInputActive {
+		m.thresholdInput, cmd = m.thresholdInput.Update(msg)
+		cmds = append(cmds, cmd)
+	}
 	m.sidebar, cmd = m.sidebar.Update(msg)
 	cmds = append(cmds, cmd)
 	m.content, cmd = m.content.Update(msg)
@@ -260,8 +305,55 @@ func (m Model) handleSidebarKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.updateContentForSelection()
 	case "/":
 		m.sidebar.EnterFilter()
+	case "t":
+		n := m.sidebar.SelectedNode()
+		if n != nil && n.kind == nodeStudent {
+			ti := textinput.New()
+			ti.CharLimit = 3
+			ti.Placeholder = fmt.Sprintf("%d", m.thresholdDays)
+			m.thresholdInput = ti
+			m.thresholdInputActive = true
+			return m, m.thresholdInput.Focus()
+		}
 	}
 	return m, nil
+}
+
+func (m Model) handleThresholdInputKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "ctrl+c":
+		return m, tea.Quit
+	case "esc":
+		m.thresholdInputActive = false
+		return m, nil
+	case "enter":
+		val, err := strconv.Atoi(strings.TrimSpace(m.thresholdInput.Value()))
+		if err != nil || val <= 0 {
+			m.thresholdInputActive = false
+			m.statusMsg = "Invalid: must be a number > 0"
+			return m, nil
+		}
+		m.thresholdDays = val
+		n := m.sidebar.SelectedNode()
+		if n != nil && n.kind == nodeStudent && n.parent != nil {
+			aID := n.parent.assignment.ID
+			delete(m.cache.statuses, aID)
+			statuses := classifier.Classify(
+				m.cache.students[aID],
+				m.cache.activity,
+				m.thresholdDays,
+			)
+			m.cache.statuses[aID] = statuses
+			m.sidebar.ApplyStatuses(aID, statuses)
+		}
+		m.thresholdInputActive = false
+		m.statusMsg = fmt.Sprintf("Threshold updated to %d days", val)
+		return m, nil
+	default:
+		var cmd tea.Cmd
+		m.thresholdInput, cmd = m.thresholdInput.Update(msg)
+		return m, cmd
+	}
 }
 
 func (m Model) handleContentKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -309,7 +401,7 @@ func (m Model) handleActivate() (tea.Model, tea.Cmd) {
 	case nodeStudent:
 		// Load activity on explicit activation (not on cursor move)
 		if cached, ok := m.cache.activity[n.student.Repository.FullName]; ok {
-			m.content.ShowActivity(cached, n.student.Repository.FullName, n.student.Repository.HTMLURL)
+			m.content.ShowActivity(cached, n.student.Repository.FullName, n.student.Repository.HTMLURL, m.statusForNode(n))
 			return m, nil
 		}
 		m.content.StartLoadingActivity(n.student.Repository.HTMLURL)
@@ -348,12 +440,25 @@ func (m Model) updateContentForSelection() (Model, tea.Cmd) {
 	case nodeStudent:
 		// Show preview — don't auto-load activity; user presses ↵ for that
 		if cached, ok := m.cache.activity[n.student.Repository.FullName]; ok {
-			m.content.ShowActivity(cached, n.student.Repository.FullName, n.student.Repository.HTMLURL)
+			m.content.ShowActivity(cached, n.student.Repository.FullName, n.student.Repository.HTMLURL, m.statusForNode(n))
 			return m, nil
 		}
 		m.content.ShowStudentPreview(n.student)
 	}
 	return m, nil
+}
+
+func (m Model) statusForNode(n *treeNode) *classifier.StudentStatus {
+	if n == nil || n.parent == nil {
+		return nil
+	}
+	repo := n.student.Repository.FullName
+	for i := range m.cache.statuses[n.parent.assignment.ID] {
+		if m.cache.statuses[n.parent.assignment.ID][i].RepoFullName == repo {
+			return &m.cache.statuses[n.parent.assignment.ID][i]
+		}
+	}
+	return nil
 }
 
 func (m Model) handleRefresh() (tea.Model, tea.Cmd) {
@@ -379,11 +484,19 @@ func (m Model) handleRefresh() (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		aID := n.parent.assignment.ID
-		delete(m.cache.students, aID)
-		n.parent.loading = true
-		n.parent.children = nil
-		n.parent.expanded = true
-		return m, tea.Batch(loadStudentsCmd(m.token, aID), m.sidebar.spinner.Tick)
+		students, ok := m.cache.students[aID]
+		if !ok {
+			return m, nil
+		}
+		for _, s := range students {
+			delete(m.cache.activity, s.Repository.FullName)
+		}
+		delete(m.cache.statuses, aID)
+		m.sidebar.ResetStatuses(aID)
+		m.content.Reset()
+		m.allActivitiesLoading = true
+		m.statusMsg = "Refreshing activity data..."
+		return m, tea.Batch(loadAllActivitiesCmd(m.token, aID, students), m.sidebar.spinner.Tick)
 	}
 	return m, nil
 }
@@ -485,9 +598,26 @@ func (m Model) breadcrumb() string {
 func (m Model) renderStatusBar() string {
 	sep := dimStyle.Render(strings.Repeat("╌", m.width))
 
+	if m.thresholdInputActive {
+		k := func(key, desc string) string {
+			return amberStyle.Render(key) + dimStyle.Render(" "+desc)
+		}
+		prompt := dimStyle.Render("Inactivity threshold (days): ") + m.thresholdInput.View()
+		hints := k("↵", "confirm") + dimStyle.Render("  ") + k("esc", "cancel")
+		lw := lipgloss.Width(prompt)
+		rw := lipgloss.Width(hints)
+		gap := m.width - lw - rw
+		if gap < 1 {
+			gap = 1
+		}
+		return sep + "\n" + prompt + strings.Repeat(" ", gap) + hints
+	}
+
 	var left string
 	if m.statusMsg != "" {
 		left = dimStyle.Render(m.statusMsg)
+	} else if m.allActivitiesLoading {
+		left = dimStyle.Render("Analysing student activity…")
 	} else if !m.rateLimitReset.IsZero() {
 		remaining := time.Until(m.rateLimitReset)
 		if remaining > 0 {
@@ -497,6 +627,8 @@ func (m Model) renderStatusBar() string {
 		} else {
 			left = dimStyle.Render("Rate limit passed · press r to retry")
 		}
+	} else if n := m.sidebar.SelectedNode(); n != nil && n.kind == nodeStudent && !m.contentFocus {
+		left = dimStyle.Render(fmt.Sprintf("Threshold: %dd", m.thresholdDays))
 	} else if url := m.currentURL(); url != "" {
 		left = amberStyle.Render(url)
 	}
@@ -538,9 +670,9 @@ func (m Model) keyHints() string {
 		return join(k("↵", "expand"), k("-", "collapse"), k("/", "filter"), k("c", "copy URL"), k("o", "open"), k("q", "quit"))
 	case nodeStudent:
 		if m.content.IsActivityLoaded() {
-			return join(k("↵", "view activity"), k("tab", "scroll"), k("o", "open repo"), k("c", "copy"), k("q", "quit"))
+			return join(k("↵", "view activity"), k("tab", "scroll"), k("o", "open repo"), k("c", "copy"), k("t", "threshold"), k("q", "quit"))
 		}
-		return join(k("↵", "view activity"), k("o", "open"), k("c", "copy"), k("q", "quit"))
+		return join(k("↵", "view activity"), k("o", "open"), k("c", "copy"), k("t", "threshold"), k("q", "quit"))
 	}
 	return join(k("↑↓", "navigate"), k("q", "quit"))
 }
@@ -733,6 +865,40 @@ func loadStudentsCmd(token string, assignmentID int) tea.Cmd {
 	return func() tea.Msg {
 		students, err := api.GetAcceptedAssignments(token, assignmentID)
 		return studentsLoadedMsg{assignmentID: assignmentID, students: students, err: err}
+	}
+}
+
+func loadAllActivitiesCmd(token string, assignmentID int, students []api.AcceptedAssignment) tea.Cmd {
+	return func() tea.Msg {
+		jobs := make(chan api.AcceptedAssignment, len(students))
+		results := make(chan struct {
+			key      string
+			activity *api.RepoActivity
+		}, len(students))
+
+		for i := 0; i < 5; i++ {
+			go func() {
+				for s := range jobs {
+					activity, _ := api.GetRepoActivity(token, s.Repository.FullName)
+					results <- struct {
+						key      string
+						activity *api.RepoActivity
+					}{s.Repository.FullName, activity}
+				}
+			}()
+		}
+
+		for _, s := range students {
+			jobs <- s
+		}
+		close(jobs)
+
+		collected := map[string]*api.RepoActivity{}
+		for range students {
+			r := <-results
+			collected[r.key] = r.activity
+		}
+		return allActivitiesLoadedMsg{assignmentID: assignmentID, activities: collected}
 	}
 }
 

@@ -9,7 +9,8 @@ import (
 )
 
 type Config struct {
-	Token string `json:"token"`
+	Token                   string `json:"token"`
+	InactivityThresholdDays int    `json:"inactivity_threshold_days"`
 }
 
 func configPath() string {
@@ -23,8 +24,13 @@ func LoadConfig() (Config, error) {
 	if err != nil {
 		return cfg, err
 	}
-	err = json.Unmarshal(data, &cfg)
-	return cfg, err
+	if err = json.Unmarshal(data, &cfg); err != nil {
+		return cfg, err
+	}
+	if cfg.InactivityThresholdDays == 0 {
+		cfg.InactivityThresholdDays = 5
+	}
+	return cfg, nil
 }
 
 func SaveConfig(cfg Config) error {

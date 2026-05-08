@@ -15,6 +15,7 @@ import (
 func main() {
 	versionFlag := flag.Bool("version", false, "print version and exit")
 	reconfigure := flag.Bool("reconfigure", false, "delete saved token and re-run first-run setup")
+	thresholdFlag := flag.Int("threshold", 0, "override inactivity threshold in days for this session")
 	flag.Parse()
 
 	if *versionFlag {
@@ -66,7 +67,12 @@ func main() {
 	// calls Init() again and can degrade gracefully on headless/SSH sessions.
 	clipboardAvailable := clipboard.Init() == nil
 
-	p := tea.NewProgram(tui.New(cfg.Token, clipboardAvailable), tea.WithAltScreen())
+	threshold := cfg.InactivityThresholdDays
+	if *thresholdFlag > 0 {
+		threshold = *thresholdFlag
+	}
+
+	p := tea.NewProgram(tui.New(cfg.Token, clipboardAvailable, threshold), tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "error running TUI: %v\n", err)
 		os.Exit(1)

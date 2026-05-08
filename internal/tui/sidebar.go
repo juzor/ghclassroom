@@ -6,6 +6,7 @@ import (
 	"unicode/utf8"
 
 	"ghclassroom/internal/api"
+	"ghclassroom/internal/classifier"
 	"github.com/charmbracelet/bubbles/spinner"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -241,6 +242,40 @@ func (s *Sidebar) SetStudents(assignmentID int, students []api.AcceptedAssignmen
 	}
 }
 
+func (s *Sidebar) ApplyStatuses(assignmentID int, statuses []classifier.StudentStatus) {
+	byRepo := make(map[string]*classifier.StudentStatus, len(statuses))
+	for i := range statuses {
+		byRepo[statuses[i].RepoFullName] = &statuses[i]
+	}
+	for _, root := range s.roots {
+		for _, aNode := range root.children {
+			if aNode.kind == nodeAssignment && aNode.assignment.ID == assignmentID {
+				aNode.classifierApplied = true
+				for _, sNode := range aNode.children {
+					if sNode.kind == nodeStudent {
+						sNode.status = byRepo[sNode.student.Repository.FullName]
+					}
+				}
+				return
+			}
+		}
+	}
+}
+
+func (s *Sidebar) ResetStatuses(assignmentID int) {
+	for _, root := range s.roots {
+		for _, aNode := range root.children {
+			if aNode.kind == nodeAssignment && aNode.assignment.ID == assignmentID {
+				aNode.classifierApplied = false
+				for _, sNode := range aNode.children {
+					sNode.status = nil
+				}
+				return
+			}
+		}
+	}
+}
+
 func (s Sidebar) Update(msg tea.Msg) (Sidebar, tea.Cmd) {
 	var cmd tea.Cmd
 	s.spinner, cmd = s.spinner.Update(msg)
@@ -383,9 +418,15 @@ func (s Sidebar) renderNode(n *treeNode, cursor bool, w int) string {
 	case n.kind == nodeEmpty:
 		indicator = dimStyle.Render("·") + " "
 	case n.kind == nodeStudent:
-		if n.student.Submitted {
+		classifierRan := n.parent != nil && n.parent.classifierApplied
+		switch {
+		case classifierRan && n.status != nil && n.status.NeedsAttention:
+			indicator = lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Render("⚠") + " "
+		case classifierRan && n.status != nil && !n.status.NeedsAttention:
+			indicator = lipgloss.NewStyle().Foreground(lipgloss.Color("2")).Render("✓") + " "
+		case n.student.Submitted:
 			indicator = cyanStyle.Render("✓") + " "
-		} else {
+		default:
 			indicator = dimStyle.Render("·") + " "
 		}
 	case n.expanded:

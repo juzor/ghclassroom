@@ -4,6 +4,7 @@ import (
 	"strings"
 
 	"ghclassroom/internal/api"
+	"ghclassroom/internal/classifier"
 )
 
 type nodeKind int
@@ -16,15 +17,17 @@ const (
 )
 
 type treeNode struct {
-	kind       nodeKind
-	classroom  api.Classroom
-	assignment api.Assignment
-	student    api.AcceptedAssignment
-	expanded   bool
-	loading    bool
-	children   []*treeNode
-	parent     *treeNode
-	depth      int
+	kind              nodeKind
+	classroom         api.Classroom
+	assignment        api.Assignment
+	student           api.AcceptedAssignment
+	status            *classifier.StudentStatus
+	classifierApplied bool // true once ApplyStatuses has run for this assignment node
+	expanded          bool
+	loading           bool
+	children          []*treeNode
+	parent            *treeNode
+	depth             int
 }
 
 func (n *treeNode) label() string {

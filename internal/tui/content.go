@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"ghclassroom/internal/api"
+	"ghclassroom/internal/classifier"
 	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
@@ -146,7 +147,7 @@ func (p *ContentPanel) ShowStudentPreview(s api.AcceptedAssignment) {
 	p.viewport.GotoTop()
 }
 
-func (p *ContentPanel) ShowActivity(activity *api.RepoActivity, repoFullName, repoURL string) {
+func (p *ContentPanel) ShowActivity(activity *api.RepoActivity, repoFullName, repoURL string, status *classifier.StudentStatus) {
 	p.loading = false
 	p.hasContent = true
 	p.activityLoaded = true
@@ -154,8 +155,17 @@ func (p *ContentPanel) ShowActivity(activity *api.RepoActivity, repoFullName, re
 	p.repoURL = repoURL
 	p.reportURL = ""
 	p.kind = nodeStudent
-	p.viewport.SetContent(renderActivity(activity, repoFullName))
+	p.viewport.SetContent(renderActivity(activity, repoFullName, status))
 	p.viewport.GotoTop()
+}
+
+func (p *ContentPanel) Reset() {
+	p.loading = false
+	p.hasContent = false
+	p.activityLoaded = false
+	p.errMsg = ""
+	p.repoURL = ""
+	p.reportURL = ""
 }
 
 func (p *ContentPanel) StartLoadingActivity(repoURL string) {

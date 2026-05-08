@@ -6,9 +6,32 @@ import (
 	"time"
 
 	"ghclassroom/internal/api"
+	"ghclassroom/internal/classifier"
+	"github.com/charmbracelet/lipgloss"
 )
 
-func renderActivity(a *api.RepoActivity, repoFullName string) string {
+func renderClassifierBadge(status *classifier.StudentStatus) string {
+	if status == nil || !status.NeedsAttention {
+		return ""
+	}
+	sigStrs := make([]string, len(status.Signals))
+	for i, sig := range status.Signals {
+		sigStrs[i] = sig.String()
+	}
+	header := redStyle.Render("⚠") + "  " + lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("214")).Render("NEEDS ATTENTION")
+	signals := "   " + strings.Join(sigStrs, " · ")
+	lines := []string{header, signals}
+	if !status.LastCommit.IsZero() {
+		lines = append(lines, "   Last commit: "+status.LastCommit.UTC().Format("2006-01-02"))
+	}
+	return lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("214")).
+		Padding(0, 1).
+		Render(strings.Join(lines, "\n"))
+}
+
+func renderActivity(a *api.RepoActivity, repoFullName string, status *classifier.StudentStatus) string {
 	if a == nil {
 		return ""
 	}
@@ -21,6 +44,11 @@ func renderActivity(a *api.RepoActivity, repoFullName string) string {
 		fmt.Fprintf(&b, "%s  %s %s\n", dimStyle.Render("Last push"), lastDate, dimStyle.Render("· "+rel))
 	}
 	fmt.Fprintln(&b)
+
+	if badge := renderClassifierBadge(status); badge != "" {
+		fmt.Fprintln(&b, badge)
+		fmt.Fprintln(&b)
+	}
 
 	fmt.Fprintln(&b, amberStyle.Render(fmt.Sprintf("COMMITS (%d)", len(a.Commits))))
 	fmt.Fprintln(&b, dimStyle.Render(strings.Repeat("╌", 60)))
