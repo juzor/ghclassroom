@@ -13,6 +13,7 @@ import (
 	"ghclassroom/internal/classifier"
 	"ghclassroom/internal/config"
 	"ghclassroom/internal/downloader"
+	"ghclassroom/internal/exporter"
 	"golang.design/x/clipboard"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
@@ -99,16 +100,20 @@ type Model struct {
 	cloneFail             int
 	cloneDir              string
 	lastDownloadDir       string
+	lastExportDir         string
+	exportAssignmentID    int
+	exportAssignmentTitle string
 	rateLimitReset        time.Time
 	showRateModal         bool
 }
 
-func New(token string, clipboardAvailable bool, thresholdDays int, lastDownloadDir string) Model {
+func New(token string, clipboardAvailable bool, thresholdDays int, lastDownloadDir, lastExportDir string) Model {
 	return Model{
 		token:              token,
 		clipboardAvailable: clipboardAvailable,
 		thresholdDays:      thresholdDays,
 		lastDownloadDir:    lastDownloadDir,
+		lastExportDir:      lastExportDir,
 		cache: cache{
 			assignments: make(map[int][]api.Assignment),
 			students:    make(map[int][]api.AcceptedAssignment),
@@ -419,6 +424,37 @@ func (m Model) handleSidebarKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.dirInput.Open("Clone all repos to: ", m.defaultDownloadDir(), nil, nil)
 			return m, m.dirInput.FocusCmd()
 		}
+	case "e":
+		n := m.sidebar.SelectedNode()
+		if n == nil {
+			return m, nil
+		}
+		var aID int
+		var aTitle string
+		switch n.kind {
+		case nodeAssignment:
+			aID = n.assignment.ID
+			aTitle = n.assignment.Title
+		case nodeStudent:
+			if n.parent == nil {
+				return m, nil
+			}
+			aID = n.parent.assignment.ID
+			aTitle = n.parent.assignment.Title
+		default:
+			return m, nil
+		}
+		students := m.cache.students[aID]
+		rows := exporter.BuildRows(aTitle, students, m.cache.activity)
+		if len(rows) == 0 {
+			m.statusMsg = "No commits to export."
+			return m, nil
+		}
+		m.cloneMode = "export"
+		m.exportAssignmentID = aID
+		m.exportAssignmentTitle = aTitle
+		m.dirInput.Open("Export to directory: ", m.defaultExportDir(), nil, nil)
+		return m, m.dirInput.FocusCmd()
 	}
 	return m, nil
 }
@@ -606,14 +642,17 @@ func (m Model) handleRefresh() (tea.Model, tea.Cmd) {
 }
 
 func (m Model) handleDirInputConfirmed(path string, priorCmd tea.Cmd) (tea.Model, tea.Cmd) {
-	m.lastDownloadDir = path
-	m.cloneDir = path
-	m.saveDownloadDir(path)
 	switch m.cloneMode {
 	case "single":
+		m.lastDownloadDir = path
+		m.cloneDir = path
+		m.saveConfig()
 		m.statusMsg = fmt.Sprintf("Cloning %s…", m.cloneSingleRepo)
 		return m, tea.Batch(priorCmd, cloneSingleCmd(m.cloneSingleURL, path, m.cloneSingleLogin, m.cloneSingleRepo))
 	case "all":
+		m.lastDownloadDir = path
+		m.cloneDir = path
+		m.saveConfig()
 		total := len(m.cloneAllStudents)
 		if total == 0 {
 			m.statusMsg = "No repos to clone."
@@ -628,6 +667,36 @@ func (m Model) handleDirInputConfirmed(path string, priorCmd tea.Cmd) (tea.Model
 		m.statusMsg = fmt.Sprintf("Cloning repos: 0/%d", total)
 		go downloader.CloneAll(m.cloneAllStudents, path, ch)
 		return m, tea.Batch(priorCmd, waitCloneProgressCmd(ch, 0, total))
+	case "export":
+		m.lastExportDir = path
+		m.saveConfig()
+		return m.handleExport(path, priorCmd)
+	}
+	return m, priorCmd
+}
+
+func (m Model) handleExport(dir string, priorCmd tea.Cmd) (tea.Model, tea.Cmd) {
+	students := m.cache.students[m.exportAssignmentID]
+	rows := exporter.BuildRows(m.exportAssignmentTitle, students, m.cache.activity)
+	if len(rows) == 0 {
+		m.statusMsg = "No commits to export."
+		return m, priorCmd
+	}
+	date := time.Now().UTC().Format("2006-01-02")
+	base := sanitiseFilename(m.exportAssignmentTitle) + "_" + date
+	csvPath := strings.Join([]string{dir, base + ".csv"}, string(os.PathSeparator))
+	xlsxPath := strings.Join([]string{dir, base + ".xlsx"}, string(os.PathSeparator))
+	var errs []string
+	if err := exporter.ExportCSV(rows, csvPath); err != nil {
+		errs = append(errs, "CSV: "+err.Error())
+	}
+	if err := exporter.ExportExcel(rows, xlsxPath); err != nil {
+		errs = append(errs, "Excel: "+err.Error())
+	}
+	if len(errs) > 0 {
+		m.statusMsg = "Export error: " + strings.Join(errs, "; ")
+	} else {
+		m.statusMsg = fmt.Sprintf("Exported %d commits → %s (.csv + .xlsx)", len(rows), dir)
 	}
 	return m, priorCmd
 }
@@ -642,11 +711,34 @@ func (m Model) defaultDownloadDir() string {
 	return "."
 }
 
-func (m Model) saveDownloadDir(dir string) {
+func (m Model) defaultExportDir() string {
+	if m.lastExportDir != "" {
+		return m.lastExportDir
+	}
+	if wd, err := os.Getwd(); err == nil {
+		return wd
+	}
+	return "."
+}
+
+func sanitiseFilename(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if r == ' ' || r == '/' || r == '\\' || r == ':' || r == '*' || r == '?' || r == '"' || r == '<' || r == '>' || r == '|' {
+			b.WriteRune('_')
+		} else {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+func (m Model) saveConfig() {
 	cfg := config.Config{
 		Token:                   m.token,
 		InactivityThresholdDays: m.thresholdDays,
-		LastDownloadDir:         dir,
+		LastDownloadDir:         m.lastDownloadDir,
+		LastExportDir:           m.lastExportDir,
 	}
 	_ = config.SaveConfig(cfg)
 }
@@ -832,12 +924,12 @@ func (m Model) keyHints() string {
 	case nodeClassroom:
 		return join(k("↵", "expand"), k("-", "collapse"), k("o", "open"), k("r", "refresh"), k("q", "quit"))
 	case nodeAssignment:
-		return join(k("↵", "expand"), k("-", "collapse"), k("/", "filter"), k("c", "copy URL"), k("o", "open"), k("q", "quit"))
+		return join(k("↵", "expand"), k("-", "collapse"), k("/", "filter"), k("c", "copy URL"), k("o", "open"), k("e", "export"), k("q", "quit"))
 	case nodeStudent:
 		if m.content.IsActivityLoaded() {
-			return join(k("↵", "view activity"), k("tab", "scroll"), k("o", "open repo"), k("c", "copy"), k("t", "threshold"), k("d", "clone"), k("D", "clone all"), k("q", "quit"))
+			return join(k("↵", "view activity"), k("tab", "scroll"), k("o", "open repo"), k("c", "copy"), k("t", "threshold"), k("d", "clone"), k("D", "clone all"), k("e", "export"), k("r", "refresh"), k("q", "quit"))
 		}
-		return join(k("↵", "view activity"), k("o", "open"), k("c", "copy"), k("t", "threshold"), k("d", "clone"), k("D", "clone all"), k("q", "quit"))
+		return join(k("↵", "view activity"), k("o", "open"), k("c", "copy"), k("t", "threshold"), k("d", "clone"), k("D", "clone all"), k("e", "export"), k("r", "refresh"), k("q", "quit"))
 	}
 	return join(k("↑↓", "navigate"), k("q", "quit"))
 }

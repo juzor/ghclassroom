@@ -12,6 +12,7 @@ type Config struct {
 	Token                   string `json:"token"`
 	InactivityThresholdDays int    `json:"inactivity_threshold_days"`
 	LastDownloadDir         string `json:"last_download_dir"`
+	LastExportDir           string `json:"last_export_dir"`
 }
 
 func configPath() string {
