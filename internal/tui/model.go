@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"os"
 	"os/exec"
 	"runtime"
 	"strconv"
@@ -10,6 +11,8 @@ import (
 
 	"ghclassroom/internal/api"
 	"ghclassroom/internal/classifier"
+	"ghclassroom/internal/config"
+	"ghclassroom/internal/downloader"
 	"golang.design/x/clipboard"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
@@ -45,6 +48,20 @@ type allActivitiesLoadedMsg struct {
 	activities   map[string]*api.RepoActivity
 }
 
+type cloneResultMsg struct {
+	login string
+	repo  string
+	err   error
+}
+
+type cloneProgressMsg struct {
+	login string
+	repo  string
+	err   error
+	done  int
+	total int
+}
+
 type tickMsg time.Time
 
 type cache struct {
@@ -69,23 +86,38 @@ type Model struct {
 	allActivitiesLoading  bool
 	thresholdInput        textinput.Model
 	thresholdInputActive  bool
+	dirInput              DirInput
+	cloneMode             string // "single" or "all"
+	cloneSingleURL        string
+	cloneSingleLogin      string
+	cloneSingleRepo       string
+	cloneAllStudents      []struct{ Login, URL string }
+	cloneCh               <-chan downloader.Result
+	cloneTotal            int
+	cloneDone             int
+	cloneSucc             int
+	cloneFail             int
+	cloneDir              string
+	lastDownloadDir       string
 	rateLimitReset        time.Time
 	showRateModal         bool
 }
 
-func New(token string, clipboardAvailable bool, thresholdDays int) Model {
+func New(token string, clipboardAvailable bool, thresholdDays int, lastDownloadDir string) Model {
 	return Model{
 		token:              token,
 		clipboardAvailable: clipboardAvailable,
 		thresholdDays:      thresholdDays,
+		lastDownloadDir:    lastDownloadDir,
 		cache: cache{
 			assignments: make(map[int][]api.Assignment),
 			students:    make(map[int][]api.AcceptedAssignment),
 			activity:    make(map[string]*api.RepoActivity),
 			statuses:    make(map[int][]classifier.StudentStatus),
 		},
-		sidebar: newSidebar(),
-		content: newContentPanel(),
+		sidebar:  newSidebar(),
+		content:  newContentPanel(),
+		dirInput: NewDirInput(),
 	}
 }
 
@@ -191,7 +223,43 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case cloneResultMsg:
+		if msg.err != nil {
+			m.statusMsg = "Clone failed: " + msg.err.Error()
+		} else {
+			m.statusMsg = fmt.Sprintf("Cloned %s to %s", msg.repo, m.cloneDir)
+		}
+		return m, nil
+
+	case cloneProgressMsg:
+		if msg.err == nil {
+			m.cloneSucc++
+		} else {
+			m.cloneFail++
+		}
+		m.cloneDone = msg.done
+		if msg.done < msg.total {
+			m.statusMsg = fmt.Sprintf("Cloning repos: %d/%d  ·  %s", msg.done, msg.total, msg.login)
+			return m, waitCloneProgressCmd(m.cloneCh, msg.done, msg.total)
+		}
+		m.statusMsg = fmt.Sprintf("Done: %d cloned, %d failed → %s", m.cloneSucc, m.cloneFail, m.cloneDir)
+		m.cloneCh = nil
+		return m, nil
+
 	case tea.KeyMsg:
+		// DirInput suppresses all other keybindings while active.
+		if m.dirInput.Active() {
+			if msg.String() == "ctrl+c" {
+				return m, tea.Quit
+			}
+			updated, cmd := m.dirInput.Update(msg)
+			m.dirInput = updated
+			if path := m.dirInput.Consume(); path != "" {
+				return m.handleDirInputConfirmed(path, cmd)
+			}
+			return m, cmd
+		}
+
 		// Threshold input suppresses everything else while active.
 		if m.thresholdInputActive {
 			return m.handleThresholdInputKeys(msg)
@@ -251,6 +319,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	var cmds []tea.Cmd
 	var cmd tea.Cmd
+	if m.dirInput.Active() {
+		updated, c := m.dirInput.Update(msg)
+		m.dirInput = updated
+		cmds = append(cmds, c)
+	}
 	if m.thresholdInputActive {
 		m.thresholdInput, cmd = m.thresholdInput.Update(msg)
 		cmds = append(cmds, cmd)
@@ -314,6 +387,37 @@ func (m Model) handleSidebarKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.thresholdInput = ti
 			m.thresholdInputActive = true
 			return m, m.thresholdInput.Focus()
+		}
+	case "d":
+		n := m.sidebar.SelectedNode()
+		if n != nil && n.kind == nodeStudent {
+			m.cloneMode = "single"
+			m.cloneSingleURL = n.student.Repository.HTMLURL
+			m.cloneSingleRepo = n.student.Repository.FullName
+			m.cloneSingleLogin = ""
+			if len(n.student.Students) > 0 {
+				m.cloneSingleLogin = n.student.Students[0].Login
+			}
+			m.dirInput.Open("Clone repo to: ", m.defaultDownloadDir(), nil, nil)
+			return m, m.dirInput.FocusCmd()
+		}
+	case "D":
+		n := m.sidebar.SelectedNode()
+		if n != nil && n.kind == nodeStudent && n.parent != nil {
+			aID := n.parent.assignment.ID
+			students := m.cache.students[aID]
+			repos := make([]struct{ Login, URL string }, 0, len(students))
+			for _, s := range students {
+				login := ""
+				if len(s.Students) > 0 {
+					login = s.Students[0].Login
+				}
+				repos = append(repos, struct{ Login, URL string }{Login: login, URL: s.Repository.HTMLURL})
+			}
+			m.cloneMode = "all"
+			m.cloneAllStudents = repos
+			m.dirInput.Open("Clone all repos to: ", m.defaultDownloadDir(), nil, nil)
+			return m, m.dirInput.FocusCmd()
 		}
 	}
 	return m, nil
@@ -501,6 +605,52 @@ func (m Model) handleRefresh() (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+func (m Model) handleDirInputConfirmed(path string, priorCmd tea.Cmd) (tea.Model, tea.Cmd) {
+	m.lastDownloadDir = path
+	m.cloneDir = path
+	m.saveDownloadDir(path)
+	switch m.cloneMode {
+	case "single":
+		m.statusMsg = fmt.Sprintf("Cloning %s…", m.cloneSingleRepo)
+		return m, tea.Batch(priorCmd, cloneSingleCmd(m.cloneSingleURL, path, m.cloneSingleLogin, m.cloneSingleRepo))
+	case "all":
+		total := len(m.cloneAllStudents)
+		if total == 0 {
+			m.statusMsg = "No repos to clone."
+			return m, priorCmd
+		}
+		ch := make(chan downloader.Result, total)
+		m.cloneCh = ch
+		m.cloneTotal = total
+		m.cloneDone = 0
+		m.cloneSucc = 0
+		m.cloneFail = 0
+		m.statusMsg = fmt.Sprintf("Cloning repos: 0/%d", total)
+		go downloader.CloneAll(m.cloneAllStudents, path, ch)
+		return m, tea.Batch(priorCmd, waitCloneProgressCmd(ch, 0, total))
+	}
+	return m, priorCmd
+}
+
+func (m Model) defaultDownloadDir() string {
+	if m.lastDownloadDir != "" {
+		return m.lastDownloadDir
+	}
+	if wd, err := os.Getwd(); err == nil {
+		return wd
+	}
+	return "."
+}
+
+func (m Model) saveDownloadDir(dir string) {
+	cfg := config.Config{
+		Token:                   m.token,
+		InactivityThresholdDays: m.thresholdDays,
+		LastDownloadDir:         dir,
+	}
+	_ = config.SaveConfig(cfg)
+}
+
 func (m Model) refreshClassrooms() (tea.Model, tea.Cmd) {
 	m.cache.classrooms = nil
 	m.sidebar.roots = nil
@@ -598,6 +748,21 @@ func (m Model) breadcrumb() string {
 func (m Model) renderStatusBar() string {
 	sep := dimStyle.Render(strings.Repeat("╌", m.width))
 
+	if m.dirInput.Active() {
+		k := func(key, desc string) string {
+			return amberStyle.Render(key) + dimStyle.Render(" "+desc)
+		}
+		prompt := m.dirInput.View()
+		hints := k("↵", "confirm") + dimStyle.Render("  ") + k("esc", "cancel")
+		lw := lipgloss.Width(prompt)
+		rw := lipgloss.Width(hints)
+		gap := m.width - lw - rw
+		if gap < 1 {
+			gap = 1
+		}
+		return sep + "\n" + prompt + strings.Repeat(" ", gap) + hints
+	}
+
 	if m.thresholdInputActive {
 		k := func(key, desc string) string {
 			return amberStyle.Render(key) + dimStyle.Render(" "+desc)
@@ -670,9 +835,9 @@ func (m Model) keyHints() string {
 		return join(k("↵", "expand"), k("-", "collapse"), k("/", "filter"), k("c", "copy URL"), k("o", "open"), k("q", "quit"))
 	case nodeStudent:
 		if m.content.IsActivityLoaded() {
-			return join(k("↵", "view activity"), k("tab", "scroll"), k("o", "open repo"), k("c", "copy"), k("t", "threshold"), k("q", "quit"))
+			return join(k("↵", "view activity"), k("tab", "scroll"), k("o", "open repo"), k("c", "copy"), k("t", "threshold"), k("d", "clone"), k("D", "clone all"), k("q", "quit"))
 		}
-		return join(k("↵", "view activity"), k("o", "open"), k("c", "copy"), k("t", "threshold"), k("q", "quit"))
+		return join(k("↵", "view activity"), k("o", "open"), k("c", "copy"), k("t", "threshold"), k("d", "clone"), k("D", "clone all"), k("q", "quit"))
 	}
 	return join(k("↑↓", "navigate"), k("q", "quit"))
 }
@@ -899,6 +1064,26 @@ func loadAllActivitiesCmd(token string, assignmentID int, students []api.Accepte
 			collected[r.key] = r.activity
 		}
 		return allActivitiesLoadedMsg{assignmentID: assignmentID, activities: collected}
+	}
+}
+
+func cloneSingleCmd(repoURL, targetDir, login, repo string) tea.Cmd {
+	return func() tea.Msg {
+		err := downloader.CloneRepo(repoURL, targetDir)
+		return cloneResultMsg{login: login, repo: repo, err: err}
+	}
+}
+
+func waitCloneProgressCmd(ch <-chan downloader.Result, done, total int) tea.Cmd {
+	return func() tea.Msg {
+		r := <-ch
+		return cloneProgressMsg{
+			login: r.Login,
+			repo:  r.Repo,
+			err:   r.Error,
+			done:  done + 1,
+			total: total,
+		}
 	}
 }
 

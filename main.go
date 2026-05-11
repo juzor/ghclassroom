@@ -72,7 +72,7 @@ func main() {
 		threshold = *thresholdFlag
 	}
 
-	p := tea.NewProgram(tui.New(cfg.Token, clipboardAvailable, threshold), tea.WithAltScreen())
+	p := tea.NewProgram(tui.New(cfg.Token, clipboardAvailable, threshold, cfg.LastDownloadDir), tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "error running TUI: %v\n", err)
 		os.Exit(1)

@@ -9,12 +9,14 @@ import (
 )
 
 type DirInput struct {
-	input     textinput.Model
-	active    bool
-	label     string
-	errMsg    string
-	onConfirm func(path string)
-	onCancel  func()
+	input         textinput.Model
+	active        bool
+	label         string
+	errMsg        string
+	confirmedPath string
+	focusCmd      tea.Cmd
+	onConfirm     func(path string)
+	onCancel      func()
 }
 
 func NewDirInput() DirInput {
@@ -25,15 +27,33 @@ func NewDirInput() DirInput {
 	return DirInput{input: ti}
 }
 
-// Open activates the prompt with the given label, pre-filled path, and callbacks.
+// Open activates the prompt. Callers must return FocusCmd() from their Update
+// to start the cursor blink animation.
 func (d *DirInput) Open(label, defaultPath string, onConfirm func(string), onCancel func()) {
 	d.label = label
 	d.errMsg = ""
+	d.confirmedPath = ""
 	d.onConfirm = onConfirm
 	d.onCancel = onCancel
 	d.input.SetValue(defaultPath)
 	d.active = true
-	d.input.Focus()
+	d.focusCmd = d.input.Focus()
+}
+
+// FocusCmd returns the cursor-blink cmd produced by Open. Call it once and
+// return it from the model's Update alongside other cmds.
+func (d *DirInput) FocusCmd() tea.Cmd {
+	cmd := d.focusCmd
+	d.focusCmd = nil
+	return cmd
+}
+
+// Consume returns the confirmed path if enter was just accepted, then clears
+// it. Returns "" if no confirmation is pending.
+func (d *DirInput) Consume() string {
+	p := d.confirmedPath
+	d.confirmedPath = ""
+	return p
 }
 
 func (d *DirInput) Update(msg tea.Msg) (DirInput, tea.Cmd) {
@@ -66,6 +86,7 @@ func (d *DirInput) Update(msg tea.Msg) (DirInput, tea.Cmd) {
 		}
 		d.active = false
 		d.errMsg = ""
+		d.confirmedPath = path
 		if d.onConfirm != nil {
 			d.onConfirm(path)
 		}
