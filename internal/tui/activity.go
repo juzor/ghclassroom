@@ -22,7 +22,7 @@ func renderClassifierBadge(status *classifier.StudentStatus) string {
 	signals := "   " + strings.Join(sigStrs, " · ")
 	lines := []string{header, signals}
 	if !status.LastCommit.IsZero() {
-		lines = append(lines, "   Last commit: "+status.LastCommit.UTC().Format("2006-01-02"))
+		lines = append(lines, "   Last commit: "+status.LastCommit.UTC().Format("02-01-2006"))
 	}
 	return lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
@@ -106,7 +106,7 @@ func formatDate(s string) string {
 	if err != nil {
 		return s
 	}
-	return t.UTC().Format("2006-01-02 15:04 UTC")
+	return t.UTC().Format("02-01-2006 15:04 UTC")
 }
 
 func shortDate(s string) string {
@@ -114,7 +114,7 @@ func shortDate(s string) string {
 	if err != nil {
 		return s
 	}
-	return t.UTC().Format("01-02")
+	return t.UTC().Format("02-01-06")
 }
 
 func relativeTime(s string) string {
