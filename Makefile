@@ -7,3 +7,4 @@ build-bin:
 build-exe:
 	# build executable for windows
 	GOOS=windows GOARCH=amd64 go build -o ghclassroom.exe .
+build-all: build build-bin build-exe
