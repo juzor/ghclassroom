@@ -7,11 +7,21 @@ import (
 
 const githubBase = "https://api.github.com"
 
-func GetRecentCommits(token, repoFullName string) ([]Commit, error) {
-	var out []Commit
-	url := fmt.Sprintf("%s/repos/%s/commits?per_page=10", githubBase, repoFullName)
-	err := doRequest(token, http.MethodGet, url, &out)
-	return out, err
+// GetAllCommits fetches every commit for the repository by following GitHub's
+// pagination Link headers, requesting 100 per page.
+func GetAllCommits(token, repoFullName string) ([]Commit, error) {
+	var all []Commit
+	url := fmt.Sprintf("%s/repos/%s/commits?per_page=100", githubBase, repoFullName)
+	for url != "" {
+		var page []Commit
+		next, err := doRequestWithNext(token, http.MethodGet, url, &page)
+		if err != nil {
+			return nil, err
+		}
+		all = append(all, page...)
+		url = next
+	}
+	return all, nil
 }
 
 func GetBranches(token, repoFullName string) ([]Branch, error) {
@@ -29,7 +39,7 @@ func GetPullRequests(token, repoFullName string) ([]PullRequest, error) {
 }
 
 func GetRepoActivity(token, repoFullName string) (*RepoActivity, error) {
-	commits, err := GetRecentCommits(token, repoFullName)
+	commits, err := GetAllCommits(token, repoFullName)
 	if err != nil {
 		return nil, err
 	}
