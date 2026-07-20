@@ -4,6 +4,8 @@
 
 Terminal UI for browsing GitHub Classroom — classrooms, assignments, student submissions, repo activity, inactivity detection, repo cloning, and commit history export.
 
+![ghclassroom TUI](img/screenshoot.png)
+
 ## Requirements
 
 - Go 1.22 or later
