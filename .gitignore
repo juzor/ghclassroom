@@ -37,3 +37,6 @@ Todo.md
 *.zip
 report/
 repo-test/
+
+*.exe
+ghclassroom
